@@ -1,0 +1,45 @@
+name: DST CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Format, Clippy, Unit & DST Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace test suite
+        run: cargo test --workspace
+
+      - name: Verify bit-exact determinism (4x4 & 3x2)
+        run: |
+          cargo run --release -p rustfs-dst-cli -- verify-determinism --topology 4x4 --seed 2026
+          cargo run --release -p rustfs-dst-cli -- verify-determinism --topology 3x2 --seed 2026
+
+      - name: Run 50-seed multi-topology DST campaign
+        run: |
+          cargo run --release -p rustfs-dst-cli -- run --scenario all --topology 4x4 --seeds 50
+          cargo run --release -p rustfs-dst-cli -- run --scenario all --topology 3x2 --seeds 50
+          cargo run --release -p rustfs-dst-cli -- run --scenario all --topology 4x2 --seeds 25

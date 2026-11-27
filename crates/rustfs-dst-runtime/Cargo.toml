@@ -1,0 +1,30 @@
+[package]
+name = "rustfs-dst-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Unified non-determinism abstraction traits (Clock, RngSource, Network, DiskIo) with production, in-memory simulation, and Tokio Turmoil backends for RustFS."
+
+[lints]
+workspace = true
+
+[features]
+default = ["turmoil-sim"]
+turmoil-sim = ["dep:turmoil"]
+madsim-compat = []
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+turmoil = { workspace = true, optional = true }
+uuid.workspace = true

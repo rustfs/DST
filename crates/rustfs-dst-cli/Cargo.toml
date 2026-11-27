@@ -1,0 +1,22 @@
+[package]
+name = "rustfs-dst-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Joshua-style multi-seed deterministic simulation runner and reproducer CLI for RustFS."
+
+[[bin]]
+name = "rustfs-dst"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+rayon.workspace = true
+rustfs-dst-faults.workspace = true
+rustfs-dst-sim.workspace = true
+serde_json.workspace = true

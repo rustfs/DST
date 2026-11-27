@@ -1,0 +1,19 @@
+# Antithesis composer manifest for RustFS DST workload execution.
+services:
+  dst-workload-4x4:
+    build:
+      context: ..
+      dockerfile: antithesis/Dockerfile
+    environment:
+      ANTITHESIS_OUTPUT_DIR: /tmp/antithesis
+      RUST_LOG: info
+    command: ["run", "--scenario", "all", "--topology", "4x4", "--seeds", "250"]
+
+  dst-workload-3x2:
+    build:
+      context: ..
+      dockerfile: antithesis/Dockerfile
+    environment:
+      ANTITHESIS_OUTPUT_DIR: /tmp/antithesis
+      RUST_LOG: info
+    command: ["run", "--scenario", "all", "--topology", "3x2", "--seeds", "250"]
