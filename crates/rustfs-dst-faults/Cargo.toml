@@ -1,0 +1,18 @@
+[package]
+name = "rustfs-dst-faults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FoundationDB-style two-stage Buggify, Antithesis-compatible CodeProbe assertions, RustFS commit CrashPoints, and Swizzle-Clog fault schedulers."
+
+[lints]
+workspace = true
+
+[dependencies]
+rustfs-dst-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true

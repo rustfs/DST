@@ -1,0 +1,25 @@
+[package]
+name = "rustfs-dst-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Simulated RustFS distributed erasure-coded storage engine, distributed lock manager, Turmoil virtual-TCP cluster, and 6-invariant DST verification suite."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+rustfs-dst-faults.workspace = true
+rustfs-dst-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+turmoil.workspace = true
+uuid.workspace = true

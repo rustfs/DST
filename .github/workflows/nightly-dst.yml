@@ -1,0 +1,37 @@
+name: Nightly DST Campaign
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per scenario per topology"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+jobs:
+  nightly-sweep:
+    name: Nightly Sweep (${{ matrix.topology }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: ["4x4", "3x2", "4x2"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run multi-seed DST campaign
+        run: |
+          SEEDS="${{ github.event.inputs.seeds || '500' }}"
+          cargo run --release -p rustfs-dst-cli -- run \
+            --scenario all \
+            --topology "${{ matrix.topology }}" \
+            --seeds "$SEEDS"
