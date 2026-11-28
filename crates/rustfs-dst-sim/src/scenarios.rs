@@ -29,7 +29,8 @@ use crate::governance::{
 };
 use crate::oracle::{ConsistencyOracle, InvariantViolation};
 use crate::pools::{
-    run_decommission_consistency_safety_scenario, run_pool_decommission_scenario,
+    run_decommission_consistency_safety_scenario, run_expansion_decommission_all_features_scenario,
+    run_expansion_rebalance_all_features_scenario, run_pool_decommission_scenario,
     run_pool_expansion_scenario, run_pool_rebalance_scenario,
     run_rebalance_consistency_safety_scenario,
 };
@@ -132,6 +133,12 @@ pub enum ScenarioKind {
     ScannerIlmReplTierCoupling,
     /// [S7] Bounded scanner cache memory, dynamic concurrency recovery, transient drive fault recovery, >64 part probe, and pool/migration pause-backlog fencing (#8456, #8477, #9469, #7967, #8667, #7968, #8564).
     ScannerPacingMemoryPoolFence,
+
+    // --- Multi-Pool Expansion + Concurrent All-Features Scenarios (2) ---
+    /// [C1] Live 3x2/4x4 multi-pool expansion followed by Pool Decommission under concurrent S3 CRUD, Multipart, CAS, WORM, ILM, Quota, and Bitrot healing.
+    ExpansionDecommissionAllFeatures,
+    /// [C2] Live 3x2/4x4 multi-pool expansion followed by Pool Rebalance under concurrent S3 CRUD, Multipart, CAS, WORM, ILM, Quota, and Bitrot healing.
+    ExpansionRebalanceAllFeatures,
 }
 
 impl ScenarioKind {
@@ -177,7 +184,12 @@ impl ScenarioKind {
         ScenarioKind::ScannerPacingMemoryPoolFence,
     ];
 
-    pub const ALL: [ScenarioKind; 33] = [
+    pub const COMPOSITE: [ScenarioKind; 2] = [
+        ScenarioKind::ExpansionDecommissionAllFeatures,
+        ScenarioKind::ExpansionRebalanceAllFeatures,
+    ];
+
+    pub const ALL: [ScenarioKind; 35] = [
         ScenarioKind::ErasureQuorum,
         ScenarioKind::CrashConsistency,
         ScenarioKind::BitrotHeal,
@@ -211,6 +223,8 @@ impl ScenarioKind {
         ScenarioKind::ScannerDeleteRecoveryEnospc,
         ScenarioKind::ScannerIlmReplTierCoupling,
         ScenarioKind::ScannerPacingMemoryPoolFence,
+        ScenarioKind::ExpansionDecommissionAllFeatures,
+        ScenarioKind::ExpansionRebalanceAllFeatures,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -248,6 +262,8 @@ impl ScenarioKind {
             Self::ScannerDeleteRecoveryEnospc => "scanner-delete-recovery-and-enospc",
             Self::ScannerIlmReplTierCoupling => "scanner-ilm-repl-tier-coupling",
             Self::ScannerPacingMemoryPoolFence => "scanner-pacing-memory-and-pool-fence",
+            Self::ExpansionDecommissionAllFeatures => "expansion-decommission-all-features",
+            Self::ExpansionRebalanceAllFeatures => "expansion-rebalance-all-features",
         }
     }
 
@@ -351,6 +367,12 @@ impl ScenarioKind {
             }
             Self::ScannerPacingMemoryPoolFence => {
                 "[S7] Bounded scanner cache memory, dynamic concurrency recovery, drive fault recovery, >64 part probe, and pool/migration pause-backlog fencing"
+            }
+            Self::ExpansionDecommissionAllFeatures => {
+                "[C1] Live 3x2/4x4 multi-pool expansion + Pool Decommission under concurrent S3 CRUD, Multipart, CAS, WORM, ILM, Quota, and Bitrot RS-healing"
+            }
+            Self::ExpansionRebalanceAllFeatures => {
+                "[C2] Live 3x2/4x4 multi-pool expansion + Pool Rebalance under concurrent S3 CRUD, Multipart, CAS, WORM, ILM, Quota, and Bitrot RS-healing"
             }
         }
     }
@@ -722,6 +744,26 @@ async fn run_scenario_async(
         }
         ScenarioKind::ScannerPacingMemoryPoolFence => {
             ops = run_scanner_pacing_memory_pool_fence_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ExpansionDecommissionAllFeatures => {
+            ops = run_expansion_decommission_all_features_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ExpansionRebalanceAllFeatures => {
+            ops = run_expansion_rebalance_all_features_scenario(
                 topology,
                 seed,
                 cluster.probes.clone(),

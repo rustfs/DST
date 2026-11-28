@@ -82,6 +82,7 @@ fn parse_scenarios(raw: &str) -> Result<Vec<ScenarioKind>, String> {
         "core" => Ok(ScenarioKind::CORE.to_vec()),
         "enterprise" => Ok(ScenarioKind::ENTERPRISE.to_vec()),
         "scanner" => Ok(ScenarioKind::SCANNER.to_vec()),
+        "composite" => Ok(ScenarioKind::COMPOSITE.to_vec()),
         "replication" => Ok(vec![
             ScenarioKind::SiteReplication,
             ScenarioKind::BucketReplication,
@@ -100,6 +101,8 @@ fn parse_scenarios(raw: &str) -> Result<Vec<ScenarioKind>, String> {
             ScenarioKind::PoolRebalance,
             ScenarioKind::DecommissionConsistencySafety,
             ScenarioKind::RebalanceConsistencySafety,
+            ScenarioKind::ExpansionDecommissionAllFeatures,
+            ScenarioKind::ExpansionRebalanceAllFeatures,
         ]),
         "security" => Ok(vec![
             ScenarioKind::OidcStsAuth,
