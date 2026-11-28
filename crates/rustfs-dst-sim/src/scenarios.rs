@@ -34,6 +34,12 @@ use crate::pools::{
     run_rebalance_consistency_safety_scenario,
 };
 use crate::replication::{run_bucket_replication_scenario, run_site_replication_scenario};
+use crate::scanner::{
+    run_scanner_checkpoint_failover_scenario, run_scanner_deep_bitrot_heal_scenario,
+    run_scanner_delete_recovery_enospc_scenario, run_scanner_ilm_repl_tier_coupling_scenario,
+    run_scanner_mrf_heal_starvation_scenario, run_scanner_pacing_memory_pool_fence_scenario,
+    run_scanner_usage_census_durability_scenario,
+};
 use crate::security_obs::{
     run_audit_logging_scenario, run_bucket_notification_scenario, run_oidc_sts_scenario,
 };
@@ -52,7 +58,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// All supported deterministic simulation scenarios (7 core + 19 enterprise domains = 26).
+/// All supported deterministic simulation scenarios (7 core + 19 enterprise + 7 scanner = 33).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScenarioKind {
     // --- Core Storage & Consensus Scenarios (7) ---
@@ -110,6 +116,22 @@ pub enum ScenarioKind {
     CapacityQuota,
     /// #19 On-demand lazy pull-through migration with local overwrite & tombstone shadowing.
     OnDemandMigration,
+
+    // --- Scanner-Centric Issue-Driven Chaos Scenarios (7) ---
+    /// [S1] Scanner SATB convergence, checkpoint survival across lock timeout/errors, and leader failover (#7108, #8494, #8461, #8457, #8618, #8141, #8297, #8888).
+    ScannerCheckpointFailover,
+    /// [S2] Scanner usage census durability, follower dirty-journal observation, ENOENT debt safety, read-only /tmp, and ILM decrement (#9520, #9471, #9664, #9672, #8478, #8670, #6958, #8106, #8924).
+    ScannerUsageCensusDurability,
+    /// [S3] MRF discharge for healthy/legacy/absent objects, anti-starvation priority lanes, and stranded xl.meta.bkp convergence (#9629, #9370, #7951, #7997, #8608, #9671).
+    ScannerMrfHealStarvation,
+    /// [S4] Deep bitrot in-place heal (no EEXIST), xl.meta corruption, 1-byte tail truncation, stale delete-marker rejoin, and Deep pacing (#5821, #5837, #8005, #8007, #8015, #8764).
+    ScannerDeepBitrotHeal,
+    /// [S5] Crash mid-delete consistency, outdated generation heal, legacy residue quarantine, ENOSPC DeleteObject, and sub-quorum multipart cleanup (#9517, #8464, #9673, #9594, #9461, #9647, #9015).
+    ScannerDeleteRecoveryEnospc,
+    /// [S6] Scanner-hosted ILM rule deletion persistence, already-deleted expiry safety, replication backfill/HEAD-405, restore copy-back atomicity, and tier free-version recovery (#8620, #8454, #8768, #7959, #8834, #8758, #9434).
+    ScannerIlmReplTierCoupling,
+    /// [S7] Bounded scanner cache memory, dynamic concurrency recovery, transient drive fault recovery, >64 part probe, and pool/migration pause-backlog fencing (#8456, #8477, #9469, #7967, #8667, #7968, #8564).
+    ScannerPacingMemoryPoolFence,
 }
 
 impl ScenarioKind {
@@ -145,7 +167,17 @@ impl ScenarioKind {
         ScenarioKind::OnDemandMigration,
     ];
 
-    pub const ALL: [ScenarioKind; 26] = [
+    pub const SCANNER: [ScenarioKind; 7] = [
+        ScenarioKind::ScannerCheckpointFailover,
+        ScenarioKind::ScannerUsageCensusDurability,
+        ScenarioKind::ScannerMrfHealStarvation,
+        ScenarioKind::ScannerDeepBitrotHeal,
+        ScenarioKind::ScannerDeleteRecoveryEnospc,
+        ScenarioKind::ScannerIlmReplTierCoupling,
+        ScenarioKind::ScannerPacingMemoryPoolFence,
+    ];
+
+    pub const ALL: [ScenarioKind; 33] = [
         ScenarioKind::ErasureQuorum,
         ScenarioKind::CrashConsistency,
         ScenarioKind::BitrotHeal,
@@ -172,6 +204,13 @@ impl ScenarioKind {
         ScenarioKind::S3Tables,
         ScenarioKind::CapacityQuota,
         ScenarioKind::OnDemandMigration,
+        ScenarioKind::ScannerCheckpointFailover,
+        ScenarioKind::ScannerUsageCensusDurability,
+        ScenarioKind::ScannerMrfHealStarvation,
+        ScenarioKind::ScannerDeepBitrotHeal,
+        ScenarioKind::ScannerDeleteRecoveryEnospc,
+        ScenarioKind::ScannerIlmReplTierCoupling,
+        ScenarioKind::ScannerPacingMemoryPoolFence,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -202,6 +241,13 @@ impl ScenarioKind {
             Self::S3Tables => "s3-tables",
             Self::CapacityQuota => "capacity-quota",
             Self::OnDemandMigration => "on-demand-migration",
+            Self::ScannerCheckpointFailover => "scanner-checkpoint-failover",
+            Self::ScannerUsageCensusDurability => "scanner-usage-census-durability",
+            Self::ScannerMrfHealStarvation => "scanner-mrf-heal-starvation",
+            Self::ScannerDeepBitrotHeal => "scanner-deep-bitrot-heal",
+            Self::ScannerDeleteRecoveryEnospc => "scanner-delete-recovery-and-enospc",
+            Self::ScannerIlmReplTierCoupling => "scanner-ilm-repl-tier-coupling",
+            Self::ScannerPacingMemoryPoolFence => "scanner-pacing-memory-and-pool-fence",
         }
     }
 
@@ -284,6 +330,27 @@ impl ScenarioKind {
             }
             Self::OnDemandMigration => {
                 "[#19] Lazy pull-through migration from legacy S3/MinIO with strict overwrite & tombstone shadowing"
+            }
+            Self::ScannerCheckpointFailover => {
+                "[S1] Scanner SATB convergence under continuous writes, checkpoint failover, lock-timeout resilience, and cycle_mismatch recovery"
+            }
+            Self::ScannerUsageCensusDurability => {
+                "[S2] Scanner usage census durability, follower dirty-journal observation, ENOENT debt safety, read-only /tmp fallback, and ILM decrement"
+            }
+            Self::ScannerMrfHealStarvation => {
+                "[S3] MRF discharge for healthy/legacy/absent objects, anti-starvation heal lanes, and stranded xl.meta.bkp convergence"
+            }
+            Self::ScannerDeepBitrotHeal => {
+                "[S4] Deep bitrot in-place heal (no EEXIST), xl.meta corruption, 1-byte tail truncation, stale delete-marker rejoin, and Deep pacing"
+            }
+            Self::ScannerDeleteRecoveryEnospc => {
+                "[S5] Mid-delete crash consistency, outdated generation heal, legacy residue quarantine, ENOSPC DeleteObject, and sub-quorum multipart cleanup"
+            }
+            Self::ScannerIlmReplTierCoupling => {
+                "[S6] Scanner-driven deleted ILM persistence, already-deleted expiry safety, replication backfill/HEAD-405, restore atomicity, and tier recovery"
+            }
+            Self::ScannerPacingMemoryPoolFence => {
+                "[S7] Bounded scanner cache memory, dynamic concurrency recovery, drive fault recovery, >64 part probe, and pool/migration pause-backlog fencing"
             }
         }
     }
@@ -586,6 +653,76 @@ async fn run_scenario_async(
         }
         ScenarioKind::OnDemandMigration => {
             ops = run_on_demand_migration_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerCheckpointFailover => {
+            ops = run_scanner_checkpoint_failover_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerUsageCensusDurability => {
+            ops = run_scanner_usage_census_durability_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerMrfHealStarvation => {
+            ops = run_scanner_mrf_heal_starvation_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerDeepBitrotHeal => {
+            ops = run_scanner_deep_bitrot_heal_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerDeleteRecoveryEnospc => {
+            ops = run_scanner_delete_recovery_enospc_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerIlmReplTierCoupling => {
+            ops = run_scanner_ilm_repl_tier_coupling_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::ScannerPacingMemoryPoolFence => {
+            ops = run_scanner_pacing_memory_pool_fence_scenario(
+                topology,
                 seed,
                 cluster.probes.clone(),
                 &mut oracle,

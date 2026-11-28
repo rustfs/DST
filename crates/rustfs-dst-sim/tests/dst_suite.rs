@@ -13,17 +13,18 @@
 // limitations under the License.
 
 //! Integration test suite proving determinism and invariant preservation across
-//! all 26 RustFS DST scenarios (7 core + 19 enterprise domains) and official
-//! topologies (`4x4`, `3x2`, `4x2`).
+//! all 33 RustFS DST scenarios (7 core + 19 enterprise + 7 scanner chaos) and
+//! official topologies (`4x4`, `3x2`, `4x2`).
 
 use rustfs_dst_sim::scenarios::{ScenarioKind, run_scenario};
 use rustfs_dst_sim::topology::TopologyKind;
 
 #[test]
-fn all_26_scenarios_pass_across_4x4_3x2_and_4x2() {
-    assert_eq!(ScenarioKind::ALL.len(), 26);
+fn all_33_scenarios_pass_across_4x4_3x2_and_4x2() {
+    assert_eq!(ScenarioKind::ALL.len(), 33);
     assert_eq!(ScenarioKind::CORE.len(), 7);
     assert_eq!(ScenarioKind::ENTERPRISE.len(), 19);
+    assert_eq!(ScenarioKind::SCANNER.len(), 7);
 
     for topo in [
         TopologyKind::FourByFour,
@@ -69,7 +70,7 @@ fn identical_seeds_produce_identical_passing_reports() {
 }
 
 #[test]
-fn multi_seed_swizzle_clog_and_enterprise_chaos_holds_all_invariants() {
+fn multi_seed_swizzle_clog_enterprise_and_scanner_chaos_hold_all_invariants() {
     for seed in 1..=15u64 {
         for topo in [TopologyKind::FourByFour, TopologyKind::ThreeByTwo] {
             let chaos = run_scenario(ScenarioKind::SwizzleClogChaos, topo, seed);
@@ -78,6 +79,14 @@ fn multi_seed_swizzle_clog_and_enterprise_chaos_holds_all_invariants() {
                 "SwizzleClogChaos failed on {topo} seed={seed}: {:?}",
                 chaos.violations
             );
+            for scenario in ScenarioKind::SCANNER {
+                let rep = run_scenario(scenario, topo, seed);
+                assert!(
+                    rep.passed,
+                    "scanner scenario {scenario} failed on {topo} seed={seed}: {:?}",
+                    rep.violations
+                );
+            }
         }
         for scenario in ScenarioKind::ENTERPRISE {
             let rep = run_scenario(scenario, TopologyKind::FourByFour, seed);

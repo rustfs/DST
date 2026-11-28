@@ -147,6 +147,8 @@ struct ReadShardReq {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum ReadShardResp {
     NotFound,
+    /// `xl.meta` exists on an online drive but failed CRC/JSON decode (`rustfs#5837`).
+    CorruptMeta,
     Found {
         meta: XlMeta,
         shard_bytes: Option<Vec<u8>>,
@@ -437,21 +439,22 @@ impl NodeRpcServer {
         let resp = match disk.read_file(&dst_meta).await {
             Err(DiskError::NotFound(_)) => ReadShardResp::NotFound,
             Err(e) => return Err(NetError::Io(e.to_string())),
-            Ok(bytes) => {
-                let meta: XlMeta = serde_json::from_slice(&bytes)
-                    .map_err(|e| NetError::Io(format!("corrupt xl.meta: {e}")))?;
-                let shard_bytes = if req.include_data && !meta.is_delete_marker {
-                    let part_path =
-                        format!("{}/{}/{}/part.1", req.bucket, req.key, meta.version_id);
-                    match disk.read_file(&part_path).await {
-                        Ok(b) => Some(b.to_vec()),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-                ReadShardResp::Found { meta, shard_bytes }
-            }
+            Ok(bytes) => match serde_json::from_slice::<XlMeta>(&bytes) {
+                Err(_) => ReadShardResp::CorruptMeta,
+                Ok(meta) => {
+                    let shard_bytes = if req.include_data && !meta.is_delete_marker {
+                        let part_path =
+                            format!("{}/{}/{}/part.1", req.bucket, req.key, meta.version_id);
+                        match disk.read_file(&part_path).await {
+                            Ok(b) => Some(b.to_vec()),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    ReadShardResp::Found { meta, shard_bytes }
+                }
+            },
         };
         let payload = serde_json::to_vec(&resp).map_err(|e| NetError::Io(e.to_string()))?;
         Ok(RpcFrame::new(METHOD_DISK_READ, payload))
@@ -816,6 +819,46 @@ impl SimCluster {
         disk.inject_bitrot(&path)
     }
 
+    /// Inject silent bitrot directly into `xl.meta` on `(node_id, drive_idx)`
+    /// (reproduces `rustfs/rustfs#5837`).
+    pub fn inject_xl_meta_bitrot(
+        &self,
+        node_id: &str,
+        drive_idx: usize,
+        bucket: &str,
+        key: &str,
+    ) -> bool {
+        let Some(env) = self.nodes.get(node_id) else {
+            return false;
+        };
+        let Some(disk) = env.disks.get(drive_idx) else {
+            return false;
+        };
+        let path = format!("{bucket}/{key}/xl.meta");
+        disk.inject_bitrot(&path)
+    }
+
+    /// Inject silent tail-truncation corruption on an object's shard
+    /// (reproduces `rustfs/rustfs#8005` 1-byte tail truncation).
+    pub fn inject_object_tail_truncate(
+        &self,
+        node_id: &str,
+        drive_idx: usize,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        trim_bytes: usize,
+    ) -> bool {
+        let Some(env) = self.nodes.get(node_id) else {
+            return false;
+        };
+        let Some(disk) = env.disks.get(drive_idx) else {
+            return false;
+        };
+        let path = format!("{bucket}/{key}/{version_id}/part.1");
+        disk.inject_tail_truncate(&path, trim_bytes)
+    }
+
     /// Heal all network partitions, restart all downed nodes, bring all drives
     /// online, and reset clock skews.
     pub fn heal_infrastructure(&self) {
@@ -853,8 +896,17 @@ impl SimCluster {
                 && let Ok(resp) = serde_json::from_slice::<ReadShardResp>(&frame.payload)
             {
                 responded += 1;
-                if let ReadShardResp::Found { meta, shard_bytes } = resp {
-                    found.push((global_idx, meta, shard_bytes));
+                match resp {
+                    ReadShardResp::Found { meta, shard_bytes } => {
+                        found.push((global_idx, meta, shard_bytes));
+                    }
+                    ReadShardResp::CorruptMeta => {
+                        self.probes.reachable(
+                            "ecstore.xl_meta_bitrot_detected",
+                            json!({"bucket": bucket, "key": key, "node": node_id, "drive": drive_idx}),
+                        );
+                    }
+                    ReadShardResp::NotFound => {}
                 }
             }
         }
