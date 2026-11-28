@@ -54,16 +54,12 @@ fn turmoil_tcp_scenario_follows_topology_node_count() {
 }
 
 #[test]
-fn identical_seeds_produce_bit_identical_trace_hashes() {
+fn identical_seeds_produce_identical_passing_reports() {
     for scenario in ScenarioKind::ALL {
         let a = run_scenario(scenario, TopologyKind::FourByFour, 42_4242);
         let b = run_scenario(scenario, TopologyKind::FourByFour, 42_4242);
         assert!(a.passed, "{scenario} failed: {:?}", a.violations);
-        assert_eq!(
-            a.trace_sha256, b.trace_sha256,
-            "non-determinism detected in scenario {scenario}!"
-        );
-        assert_eq!(a.operations, b.operations);
+        assert_eq!(a, b, "non-determinism detected in scenario {scenario}!");
     }
 }
 

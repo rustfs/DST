@@ -4,7 +4,7 @@
 
 **RustFS DST** is the official Deterministic Simulation Testing (DST) framework, runtime trait abstraction layer, virtual fault simulator, and multi-seed correctness verifier for [RustFS](https://github.com/rustfs/rustfs).
 
-Inspired by FoundationDB's Flow simulator, Tokio [`turmoil`](https://github.com/tokio-rs/turmoil), [`madsim`](https://github.com/madsim-rs/madsim), and [Antithesis](https://antithesis.com/), RustFS DST abstracts every source of non-determinism in a distributed storage engine behind clean Rust traits so complex multi-node failure modes execute deterministically inside a single process and reproduce bit-for-bit from a single `u64` seed.
+Inspired by FoundationDB's Flow simulator, Tokio [`turmoil`](https://github.com/tokio-rs/turmoil), [`madsim`](https://github.com/madsim-rs/madsim), and [Antithesis](https://antithesis.com/), RustFS DST uses runtime traits to run a storage model against seeded faults. The scenarios execute `SimECStore` or the Turmoil quorum model. The [upstream adoption plan](docs/architecture.md) describes how to apply these runtime traits to RustFS itself.
 
 ## Core Architecture
 
@@ -38,8 +38,8 @@ Inspired by FoundationDB's Flow simulator, Tokio [`turmoil`](https://github.com/
 
 ## Verified Invariants
 
-1. **Linearizability & Monotonic Read-After-Write**: Readers never observe a generation older than an acknowledged write or delete, even across degraded quorums (`W + R > N`).
-2. **Bit-Exact Data Integrity**: Every readable object matches the exact SHA-256 of a submitted payload; silent bitrot up to the parity limit is detected and reconstructed transparently.
+1. **Sequential S3 Read-After-Write Consistency**: GET responses must match a possible current version after acknowledged or indeterminate writes and deletes. LIST is checked against acknowledged live keys and their version metadata before repair.
+2. **Bit-Exact Data Integrity**: Every readable object matches the exact SHA-256 of an acknowledged or indeterminate write for that version. Silent bitrot up to the parity limit is detected and reconstructed transparently.
 3. **Crash Atomicity (Old-or-New-Never-Mixed)**: Abrupt power loss (`SimDiskIo::crash_and_reboot`) at any RustFS `xl.meta` commit window drops un-fsynced page-cache state without corrupting previously committed versions.
 4. **Quorum Safety**: Writes fail closed on minority partitions and roll back partial drive writes cleanly; reply drops after remote apply are modeled as indeterminate outcomes.
 5. **Distributed Lock Mutual Exclusion & Monotonic Fencing**: Monotonic-clock quorum leases remain immune to wall-clock skew jumps and issue strictly increasing fencing epochs.
@@ -51,7 +51,7 @@ Inspired by FoundationDB's Flow simulator, Tokio [`turmoil`](https://github.com/
 # Run the full unit and integration test suite
 cargo test --workspace
 
-# Prove bit-for-bit determinism across every scenario
+# Compare two passing reports for every scenario
 cargo run --release -p rustfs-dst-cli -- verify-determinism --topology 4x4 --seed 2026
 
 # Run a 100-seed parallel DST campaign on 4x4 and 3x2 topologies
