@@ -176,6 +176,10 @@ impl ProbeRegistry {
     }
 
     fn append_jsonl<T: Serialize>(&self, path: &PathBuf, payload: &T) {
+        // Campaigns run seeds on a rayon pool. Each seed has its own registry,
+        // so the file append itself has to be process-wide or JSONL lines tear.
+        static APPEND_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = APPEND_LOCK.lock().expect("antithesis append lock poisoned");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

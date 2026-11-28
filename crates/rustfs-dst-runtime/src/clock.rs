@@ -298,19 +298,30 @@ impl Clock for SimClock {
             self.advance(duration);
             return;
         }
-        let notify = {
+        let delta_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let deadline = {
+            let inner = self.inner.lock().expect("SimClock lock poisoned");
+            inner.now_ns.saturating_add(delta_ns)
+        };
+        // Register interest before checking the deadline. `Notify::notified`
+        // drops a `notify_waiters` that arrives before the future is polled,
+        // which previously hung the sleeper if `advance` won that race.
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
             let mut inner = self.inner.lock().expect("SimClock lock poisoned");
-            let delta_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-            let deadline = inner.now_ns.saturating_add(delta_ns);
-            let notify = Arc::new(Notify::new());
+            if inner.now_ns >= deadline {
+                return;
+            }
             inner
                 .waiters
                 .entry(deadline)
                 .or_default()
                 .push(Arc::clone(&notify));
-            notify
-        };
-        notify.notified().await;
+        }
+        notified.await;
     }
 }
 

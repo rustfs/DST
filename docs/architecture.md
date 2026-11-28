@@ -15,7 +15,7 @@ DST eliminates all four sources of non-determinism by injecting trait-based abst
 | System time | `SystemTime::now()`, `Instant::now()`, `tokio::time::sleep` in `ecstore`, `lock`, `heal`, `scanner` | `Clock` | Virtual discrete-event clock with per-node wall-clock skew and monotonic drift |
 | Randomness | `rand::rng()`, `Uuid::new_v4()` for version IDs, upload IDs, temp names, backoff jitter | `RngSource` | ChaCha8 PRNG with SHA-256 domain-separated `fork(label)` sub-streams |
 | Network I/O | Inter-node gRPC/Tonic RPCs (`PeerDisk`, `RemoteClient` locks) | `Network` / `turmoil::net` | Symmetric/asymmetric partitions, Swizzle-Clog jitter, packet drop, post-apply reply drop |
-| Disk I/O | `tokio::fs` / `std::fs` in `ecstore::disk::local::LocalDisk` | `DiskIo` | Explicit volatile page-cache vs durable `fsync` split, power-loss `crash_and_reboot`, bitrot, torn writes, `ENOSPC` |
+| Disk I/O | `tokio::fs` / `std::fs` in `ecstore::disk::local::LocalDisk` | `DiskIo` | Inode bytes become durable only on `fsync_file`; directory entries become durable only on `fsync_dir` (which does not flush dirty file data); power-loss `crash_and_reboot`, bitrot, torn writes, `ENOSPC` |
 
 ## 2. Two-Phase Crash-Consistent Commit Model
 

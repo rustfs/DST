@@ -126,6 +126,23 @@ impl ConsistencyOracle {
         self.indeterminate.remove(full_key);
     }
 
+    pub fn record_indeterminate_delete(
+        &mut self,
+        full_key: &str,
+        generation: u64,
+        version_id: String,
+    ) {
+        self.indeterminate
+            .entry(full_key.to_string())
+            .or_default()
+            .push(CommittedState {
+                generation,
+                version_id,
+                is_deleted: true,
+                payload_sha256: None,
+            });
+    }
+
     pub fn record_indeterminate_put(
         &mut self,
         full_key: &str,
@@ -229,7 +246,12 @@ impl ConsistencyOracle {
     /// Verify a `NotFound` / deleted read response against acknowledged state.
     pub fn check_read_not_found(&mut self, full_key: &str) {
         if let Some(acked) = self.acked.get(full_key) {
-            let valid = acked.is_deleted;
+            let indeterminate_delete = self.indeterminate.get(full_key).is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate.is_deleted && candidate.generation >= acked.generation
+                })
+            });
+            let valid = acked.is_deleted || indeterminate_delete;
             self.probes.always(
                 "invariant.no_lost_acknowledged_write",
                 valid,

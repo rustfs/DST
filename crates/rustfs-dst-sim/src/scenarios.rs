@@ -157,7 +157,7 @@ pub fn run_scenario(scenario: ScenarioKind, topology: TopologyKind, seed: u64) -
 }
 
 fn run_turmoil_scenario(topology: TopologySpec, seed: u64) -> ScenarioReport {
-    match run_turmoil_tcp_quorum_sim(seed) {
+    match run_turmoil_tcp_quorum_sim(topology.nodes, seed) {
         Ok(rep) => ScenarioReport {
             scenario: ScenarioKind::TurmoilTcpCluster,
             topology: topology.name.to_string(),
@@ -431,6 +431,42 @@ async fn scenario_erasure_quorum(
         ),
     }
     ops += 1;
+
+    // S3 If-None-Match: * treats a delete marker as "object does not exist".
+    let recreated = cluster
+        .put_object(
+            &nodes[0],
+            bucket,
+            del_key,
+            b"recreated-after-delete",
+            PutConditions {
+                if_none_match_any: true,
+                if_match_sha256: None,
+            },
+        )
+        .await;
+    cluster.probes.always(
+        "invariant.if_none_match_allows_delete_marker",
+        recreated.is_ok(),
+        json!({"key": del_full, "outcome": format!("{recreated:?}")}),
+    );
+    if recreated.is_err() {
+        oracle.record_violation(
+            "if_none_match_after_delete",
+            &del_full,
+            format!("If-None-Match rejected a delete marker: {recreated:?}"),
+        );
+    }
+    let deleted_again = cluster
+        .delete_object(&nodes[0], bucket, del_key)
+        .await
+        .expect("delete restored key");
+    oracle.record_acked_delete(
+        &del_full,
+        deleted_again.generation,
+        deleted_again.version_id,
+    );
+    ops += 2;
 
     for key in &keys {
         let _ = cluster.heal_object(&nodes[0], bucket, key).await;
@@ -774,7 +810,33 @@ async fn scenario_distributed_lock_skew(
     }
     c2.release(&lease2).await;
     oracle.record_lock_released(resource, "owner-2");
-    ops + 2
+    ops += 2;
+
+    // Negative control: a wall-clock lease MUST expire when skew jumps past
+    // its TTL. Monotonic leases above must keep failing that test.
+    cluster.clock.clear_faults();
+    let wall = "dst-locks/wall-clock-lease";
+    let wall_lease = c1
+        .acquire(wall, "owner-wall", 5_000, true)
+        .await
+        .expect("wall-clock lease");
+    for node in &nodes {
+        cluster.clock.set_node_skew_ms(node, 60_000);
+    }
+    let stolen = c2.acquire(wall, "owner-wall-2", 5_000, true).await;
+    cluster.probes.always(
+        "invariant.wall_clock_lease_expires_under_skew",
+        stolen.is_ok(),
+        json!({"stolen": format!("{stolen:?}"), "fence": wall_lease.fence_token}),
+    );
+    if stolen.is_err() {
+        oracle.record_violation(
+            "wall_clock_lease_skew",
+            wall,
+            "wall-clock lease survived a 60s skew jump",
+        );
+    }
+    ops + 1
 }
 
 async fn scenario_swizzle_clog_chaos(
@@ -816,7 +878,8 @@ async fn scenario_swizzle_clog_chaos(
             let key = &keys[rng.gen_range_usize(keys.len())];
             let full = format!("{bucket}/{key}");
             let via = &nodes[rng.gen_range_usize(nodes.len())];
-            if rng.gen_bool(0.55) {
+            let roll = rng.next_u64() % 100;
+            if roll < 45 {
                 let payload = deterministic_payload(rng, 128, 1024);
                 let hash = oracle.record_submitted_payload(&full, &payload);
                 match cluster
@@ -831,6 +894,19 @@ async fn scenario_swizzle_clog_chaos(
                         version_id,
                     }) => {
                         oracle.record_indeterminate_put(&full, generation, version_id, hash);
+                    }
+                    Err(_) => {}
+                }
+            } else if roll < 65 {
+                match cluster.delete_object(via, bucket, key).await {
+                    Ok(res) => {
+                        oracle.record_acked_delete(&full, res.generation, res.version_id);
+                    }
+                    Err(StoreError::Indeterminate {
+                        generation,
+                        version_id,
+                    }) => {
+                        oracle.record_indeterminate_delete(&full, generation, version_id);
                     }
                     Err(_) => {}
                 }
