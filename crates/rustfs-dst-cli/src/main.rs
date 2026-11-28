@@ -18,8 +18,11 @@
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use rustfs_dst_faults::probe::ProbeRegistry;
+use rustfs_dst_sim::oracle::InvariantViolation;
 use rustfs_dst_sim::scenarios::{ScenarioKind, ScenarioReport, run_scenario};
 use rustfs_dst_sim::topology::TopologyKind;
+use std::ops::RangeInclusive;
+use std::panic::{UnwindSafe, catch_unwind};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
@@ -62,7 +65,7 @@ enum Command {
         #[arg(long)]
         seed: u64,
     },
-    /// Execute each scenario twice with the same seed and verify identical SHA-256 trace hashes.
+    /// Execute each scenario twice with the same seed and compare both passing reports.
     VerifyDeterminism {
         #[arg(long, default_value = "4x4")]
         topology: TopologyKind,
@@ -82,6 +85,46 @@ fn parse_scenarios(raw: &str) -> Result<Vec<ScenarioKind>, String> {
         .collect::<Result<Vec<_>, _>>()
 }
 
+fn seed_range(start_seed: u64, count: u64) -> Result<RangeInclusive<u64>, &'static str> {
+    let last_offset = count.checked_sub(1).ok_or("--seeds must be at least 1")?;
+    let last_seed = start_seed
+        .checked_add(last_offset)
+        .ok_or("seed range exceeds u64::MAX")?;
+    Ok(start_seed..=last_seed)
+}
+
+fn run_case(
+    scenario: ScenarioKind,
+    topology: TopologyKind,
+    seed: u64,
+    simulate: impl FnOnce(ScenarioKind, TopologyKind, u64) -> ScenarioReport + UnwindSafe,
+) -> ScenarioReport {
+    match catch_unwind(|| simulate(scenario, topology, seed)) {
+        Ok(report) => report,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("simulation panicked");
+            ScenarioReport {
+                scenario,
+                topology: topology.to_string(),
+                seed,
+                passed: false,
+                operations: 0,
+                trace_sha256: String::new(),
+                violations: vec![InvariantViolation {
+                    invariant: "simulation_panic".to_string(),
+                    key: "scenario".to_string(),
+                    detail: detail.to_string(),
+                }],
+                probes: Default::default(),
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -97,7 +140,7 @@ fn main() -> ExitCode {
             topology,
             seed,
         } => {
-            let report = run_scenario(scenario, topology, seed);
+            let report = run_case(scenario, topology, seed, run_scenario);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).expect("serialize ScenarioReport")
@@ -111,13 +154,19 @@ fn main() -> ExitCode {
         Command::VerifyDeterminism { topology, seed } => {
             let mut ok = true;
             for scenario in ScenarioKind::ALL {
-                let r1 = run_scenario(scenario, topology, seed);
-                let r2 = run_scenario(scenario, topology, seed);
-                if !r1.passed || r1.trace_sha256 != r2.trace_sha256 {
+                let r1 = run_case(scenario, topology, seed, run_scenario);
+                let r2 = run_case(scenario, topology, seed, run_scenario);
+                if !r1.passed || r1 != r2 {
                     eprintln!(
-                        "FAIL determinism check: scenario={scenario} topo={topology} seed={seed} passed={} h1={} h2={}",
-                        r1.passed, r1.trace_sha256, r2.trace_sha256
+                        "FAIL replay: scenario={scenario} topo={topology} seed={seed} passed_1={} passed_2={} trace_1={} trace_2={}",
+                        r1.passed, r2.passed, r1.trace_sha256, r2.trace_sha256
                     );
+                    for (replay, report) in [(1, r1), (2, r2)] {
+                        eprintln!(
+                            "  replay {replay} operations={} probes={:?} violations={:?}",
+                            report.operations, report.probes, report.violations
+                        );
+                    }
                     ok = false;
                 } else {
                     println!(
@@ -148,32 +197,53 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let work: Vec<(ScenarioKind, u64)> = scenarios
-                .iter()
-                .flat_map(|&sc| (start_seed..start_seed + seeds).map(move |seed| (sc, seed)))
-                .collect();
+            let range = match seed_range(start_seed, seeds) {
+                Ok(range) => range,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Some((seeds_per_scenario, total_runs)) =
+                usize::try_from(seeds).ok().and_then(|count| {
+                    count
+                        .checked_mul(scenarios.len())
+                        .map(|total| (count, total))
+                })
+            else {
+                eprintln!("error: campaign run count exceeds platform capacity");
+                return ExitCode::FAILURE;
+            };
 
-            let reports: Vec<ScenarioReport> = work
-                .par_iter()
-                .map(|&(sc, seed)| run_scenario(sc, topology, seed))
+            let reports: Vec<_> = (0..total_runs)
+                .into_par_iter()
+                .map(|index| {
+                    let scenario = scenarios[index / seeds_per_scenario];
+                    let seed = range.start() + (index % seeds_per_scenario) as u64;
+                    run_case(scenario, topology, seed, run_scenario)
+                })
                 .collect();
 
             let aggregate_probes = ProbeRegistry::new();
             let mut failures = Vec::new();
             let mut total_ops = 0u64;
-            for rep in &reports {
-                total_ops += rep.operations;
-                aggregate_probes.merge_from(&rep.probes);
-                if !rep.passed {
-                    failures.push(rep);
+            for report in reports {
+                total_ops += report.operations;
+                aggregate_probes.merge_from(&report.probes);
+                if !report.passed {
+                    failures.push(report);
                 }
             }
 
             if json {
                 let summary = serde_json::json!({
                     "topology": topology.to_string(),
-                    "total_runs": reports.len(),
-                    "passed_runs": reports.len() - failures.len(),
+                    "scenarios": scenarios.iter().map(|scenario| scenario.slug()).collect::<Vec<_>>(),
+                    "start_seed": range.start(),
+                    "end_seed": range.end(),
+                    "seeds_per_scenario": seeds,
+                    "total_runs": total_runs,
+                    "passed_runs": total_runs - failures.len(),
                     "failed_runs": failures.len(),
                     "total_operations": total_ops,
                     "probes": aggregate_probes.snapshot(),
@@ -185,9 +255,9 @@ fn main() -> ExitCode {
                 );
             } else {
                 println!(
-                    "RustFS DST Summary: topology={topology} runs={} passed={} failed={} ops={total_ops}",
-                    reports.len(),
-                    reports.len() - failures.len(),
+                    "RustFS DST Summary: topology={topology} seeds={range:?} runs={} passed={} failed={} ops={total_ops}",
+                    total_runs,
+                    total_runs - failures.len(),
                     failures.len(),
                 );
                 let probes = aggregate_probes.snapshot();
@@ -225,5 +295,35 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_or_overflowing_campaigns_and_accepts_the_final_seed() {
+        assert!(seed_range(1, 0).is_err());
+        assert!(seed_range(u64::MAX, 2).is_err());
+        assert_eq!(
+            seed_range(u64::MAX, 1).unwrap().collect::<Vec<_>>(),
+            vec![u64::MAX]
+        );
+    }
+
+    #[test]
+    fn turns_a_scenario_panic_into_a_reproducible_failure_report() {
+        let scenario = ScenarioKind::ErasureQuorum;
+        let topology = TopologyKind::FourByFour;
+        let report = run_case(scenario, topology, 55, |_, _, _| {
+            panic!("initial write failed");
+        });
+        assert!(!report.passed);
+        assert_eq!(report.scenario, scenario);
+        assert_eq!(report.topology, topology.to_string());
+        assert_eq!(report.seed, 55);
+        assert_eq!(report.violations[0].invariant, "simulation_panic");
+        assert_eq!(report.violations[0].detail, "initial write failed");
     }
 }
