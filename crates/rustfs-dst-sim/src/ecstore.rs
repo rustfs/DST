@@ -179,6 +179,7 @@ struct StagePartReq {
     drive_idx: usize,
     upload_id: String,
     part_number: u32,
+    attempt_id: String,
     part_etag: String,
     shard_sha256: String,
     shard_bytes: Vec<u8>,
@@ -202,6 +203,7 @@ struct ReadPartReq {
     drive_idx: usize,
     upload_id: String,
     part_number: u32,
+    attempt_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,7 +217,11 @@ struct CleanupPartReq {
     drive_idx: usize,
     upload_id: String,
     part_number: u32,
-    part_etag: String,
+    attempt_id: String,
+}
+
+fn multipart_part_path(upload_id: &str, part_number: u32, attempt_id: &str) -> String {
+    format!(".rustfs.sys/multipart/{upload_id}/part.{part_number}.{attempt_id}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -524,7 +530,7 @@ impl NodeRpcServer {
     async fn handle_stage_part(&self, req: StagePartReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
         let dir = format!(".rustfs.sys/multipart/{}", req.upload_id);
-        let path = format!("{dir}/part.{}", req.part_number);
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
         let meta_path = format!("{path}.meta");
         let meta = PartOnDiskMeta {
             part_etag: req.part_etag,
@@ -555,10 +561,7 @@ impl NodeRpcServer {
 
     async fn handle_read_part(&self, req: ReadPartReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
-        let path = format!(
-            ".rustfs.sys/multipart/{}/part.{}",
-            req.upload_id, req.part_number
-        );
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
         let meta_path = format!("{path}.meta");
         let meta_bytes = disk
             .read_file(&meta_path)
@@ -585,19 +588,11 @@ impl NodeRpcServer {
     async fn handle_cleanup_part(&self, req: CleanupPartReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
         let dir = format!(".rustfs.sys/multipart/{}", req.upload_id);
-        let path = format!("{dir}/part.{}", req.part_number);
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
         let meta_path = format!("{path}.meta");
-        let matches = match disk.read_file(&meta_path).await {
-            Ok(bytes) => serde_json::from_slice::<PartOnDiskMeta>(&bytes)
-                .is_ok_and(|meta| meta.part_etag == req.part_etag),
-            Err(DiskError::NotFound(_)) => false,
-            Err(e) => return Err(NetError::Io(e.to_string())),
-        };
-        if matches {
-            let _ = disk.remove_file(&path).await;
-            let _ = disk.remove_file(&meta_path).await;
-            let _ = disk.fsync_dir(&dir).await;
-        }
+        let _ = disk.remove_file(&path).await;
+        let _ = disk.remove_file(&meta_path).await;
+        let _ = disk.fsync_dir(&dir).await;
         Ok(RpcFrame::new(METHOD_DISK_CLEANUP_PART, Vec::new()))
     }
 
@@ -688,7 +683,14 @@ impl RpcHandler for NodeRpcServer {
 struct MultipartSession {
     bucket: String,
     key: String,
-    parts: BTreeMap<u32, usize>, // part_number -> orig_len
+    parts: BTreeMap<u32, MultipartPart>,
+}
+
+#[derive(Clone, Debug)]
+struct MultipartPart {
+    attempt_id: String,
+    etag: String,
+    original_len: usize,
 }
 
 /// A simulated multi-node RustFS cluster wired over deterministic runtime traits.
@@ -1314,7 +1316,11 @@ impl SimCluster {
         }
         let shards = encode(data, self.topology.data_shards, self.topology.parity_shards)
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        let part_etag = sha256_hex(data);
+        let part = MultipartPart {
+            attempt_id: self.rng.gen_uuid_v4().to_string(),
+            etag: sha256_hex(data),
+            original_len: data.len(),
+        };
 
         let mut acked = 0usize;
         for (node_id, drive_idx, global_idx) in self.drive_slots() {
@@ -1323,12 +1329,13 @@ impl SimCluster {
                 drive_idx,
                 upload_id: upload_id.to_string(),
                 part_number,
-                part_etag: part_etag.clone(),
+                attempt_id: part.attempt_id.clone(),
+                part_etag: part.etag.clone(),
                 shard_sha256: shard.sha256_hex.clone(),
                 shard_bytes: shard.bytes.clone(),
             };
             let payload = serde_json::to_vec(&req).expect("serialize StagePartReq");
-            match self
+            if self
                 .network
                 .call(
                     via_node,
@@ -1336,40 +1343,58 @@ impl SimCluster {
                     RpcFrame::new(METHOD_DISK_STAGE_PART, payload),
                 )
                 .await
+                .is_ok()
             {
-                Ok(_) | Err(NetError::ReplyDroppedAfterApply { .. }) => acked += 1,
-                Err(_) => {}
+                acked += 1;
             }
         }
 
         if acked < self.topology.write_quorum {
-            // Remove only this attempt's etag so a previous successful part remains.
-            for (node_id, drive_idx, _) in self.drive_slots() {
-                let req = CleanupPartReq {
-                    drive_idx,
-                    upload_id: upload_id.to_string(),
-                    part_number,
-                    part_etag: part_etag.clone(),
-                };
-                let payload = serde_json::to_vec(&req).expect("serialize CleanupPartReq");
-                let _ = self
-                    .network
-                    .call(
-                        via_node,
-                        &node_id,
-                        RpcFrame::new(METHOD_DISK_CLEANUP_PART, payload),
-                    )
-                    .await;
-            }
+            self.cleanup_multipart_part(via_node, upload_id, part_number, &part.attempt_id)
+                .await;
             return Err(StoreError::WriteQuorumNotMet {
                 acked,
                 required: self.topology.write_quorum,
             });
         }
-        if let Some(sess) = self.multipart_sessions.get_mut(upload_id) {
-            sess.parts.insert(part_number, data.len());
+
+        let previous = self
+            .multipart_sessions
+            .get_mut(upload_id)
+            .expect("upload session cannot change during staging")
+            .parts
+            .insert(part_number, part);
+        if let Some(previous) = previous {
+            self.cleanup_multipart_part(via_node, upload_id, part_number, &previous.attempt_id)
+                .await;
         }
         Ok(())
+    }
+
+    async fn cleanup_multipart_part(
+        &self,
+        via_node: &str,
+        upload_id: &str,
+        part_number: u32,
+        attempt_id: &str,
+    ) {
+        for (node_id, drive_idx, _) in self.drive_slots() {
+            let req = CleanupPartReq {
+                drive_idx,
+                upload_id: upload_id.to_string(),
+                part_number,
+                attempt_id: attempt_id.to_string(),
+            };
+            let payload = serde_json::to_vec(&req).expect("serialize CleanupPartReq");
+            let _ = self
+                .network
+                .call(
+                    via_node,
+                    &node_id,
+                    RpcFrame::new(METHOD_DISK_CLEANUP_PART, payload),
+                )
+                .await;
+        }
     }
 
     /// Atomically assemble staged multipart parts and commit the final object.
@@ -1385,13 +1410,14 @@ impl SimCluster {
             .ok_or_else(|| StoreError::UploadNotFound(upload_id.to_string()))?;
 
         let mut assembled = Vec::new();
-        for (&part_number, &orig_len) in &sess.parts {
-            let mut by_etag: BTreeMap<String, Vec<(usize, Vec<u8>)>> = BTreeMap::new();
+        for (&part_number, part) in &sess.parts {
+            let mut shards = Vec::new();
             for (node_id, drive_idx, global_idx) in self.drive_slots() {
                 let req = ReadPartReq {
                     drive_idx,
                     upload_id: upload_id.to_string(),
                     part_number,
+                    attempt_id: part.attempt_id.clone(),
                 };
                 let payload = serde_json::to_vec(&req).expect("serialize ReadPartReq");
                 let Ok(frame) = self
@@ -1408,35 +1434,11 @@ impl SimCluster {
                 let Ok(resp) = serde_json::from_slice::<ReadPartResp>(&frame.payload) else {
                     continue;
                 };
-                if sha256_hex(&resp.shard_bytes) != resp.shard_sha256 {
-                    continue;
+                if resp.part_etag == part.etag && sha256_hex(&resp.shard_bytes) == resp.shard_sha256
+                {
+                    shards.push((global_idx, resp.shard_bytes));
                 }
-                by_etag
-                    .entry(resp.part_etag)
-                    .or_default()
-                    .push((global_idx, resp.shard_bytes));
             }
-            let Some((_, mut shards)) = by_etag.into_iter().max_by(|left, right| {
-                left.1
-                    .len()
-                    .cmp(&right.1.len())
-                    .then_with(|| left.0.cmp(&right.0))
-            }) else {
-                return Err(StoreError::ReadQuorumNotMet {
-                    healthy: 0,
-                    required: self.topology.write_quorum,
-                });
-            };
-            // A part is durable only once one etag reached write quorum. Mixing
-            // shards from two UploadPart attempts reconstructs a payload nobody wrote.
-            if shards.len() < self.topology.write_quorum {
-                return Err(StoreError::ReadQuorumNotMet {
-                    healthy: shards.len(),
-                    required: self.topology.write_quorum,
-                });
-            }
-            shards.sort_by_key(|(idx, _)| *idx);
-            shards.dedup_by_key(|(idx, _)| *idx);
             if shards.len() < self.topology.data_shards {
                 return Err(StoreError::ReadQuorumNotMet {
                     healthy: shards.len(),
@@ -1447,9 +1449,14 @@ impl SimCluster {
                 &shards,
                 self.topology.data_shards,
                 self.topology.parity_shards,
-                orig_len,
+                part.original_len,
             )
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if sha256_hex(&part_bytes) != part.etag {
+                return Err(StoreError::Internal(format!(
+                    "reconstructed payload digest mismatch for part {part_number}"
+                )));
+            }
             assembled.extend_from_slice(&part_bytes);
         }
 
@@ -1843,5 +1850,58 @@ mod tests {
                 assert!(leaked.is_empty(), "{leaked:?}");
             }
         }
+    }
+    #[tokio::test]
+    async fn failed_replacement_preserves_the_acknowledged_part() {
+        let original = b"acknowledged-part";
+        for replacement in [original.as_slice(), b"different-payload"] {
+            let mut cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 15);
+            let upload_id = cluster.create_multipart("bkt", "obj");
+            // The acknowledged part initially exists on exactly the write quorum.
+            for (node, drive, _) in cluster.drive_slots().into_iter().skip(4) {
+                cluster.set_drive_offline(&node, drive, true);
+            }
+            cluster
+                .upload_part("n1", &upload_id, 1, original)
+                .await
+                .expect("initial part");
+
+            for (node, drive, _) in cluster.drive_slots().into_iter().skip(3) {
+                cluster.set_drive_offline(&node, drive, true);
+            }
+            assert!(matches!(
+                cluster.upload_part("n1", &upload_id, 1, replacement).await,
+                Err(StoreError::WriteQuorumNotMet { .. })
+            ));
+            cluster.heal_infrastructure();
+
+            cluster
+                .complete_multipart("n1", &upload_id)
+                .await
+                .expect("previously acknowledged part must still complete");
+            let got = cluster.get_object("n2", "bkt", "obj").await.expect("get");
+            assert_eq!(got.payload, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_replacement_is_selected_by_completion() {
+        let mut cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 16);
+        let upload_id = cluster.create_multipart("bkt", "obj");
+        cluster
+            .upload_part("n1", &upload_id, 1, b"old-part")
+            .await
+            .expect("initial part");
+        cluster
+            .upload_part("n1", &upload_id, 1, b"new-part-with-different-length")
+            .await
+            .expect("replace part");
+
+        cluster
+            .complete_multipart("n1", &upload_id)
+            .await
+            .expect("complete replacement");
+        let got = cluster.get_object("n2", "bkt", "obj").await.expect("get");
+        assert_eq!(got.payload, b"new-part-with-different-length");
     }
 }
