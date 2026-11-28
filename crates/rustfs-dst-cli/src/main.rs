@@ -81,6 +81,7 @@ fn parse_scenarios(raw: &str) -> Result<Vec<ScenarioKind>, String> {
         "all" => Ok(ScenarioKind::ALL.to_vec()),
         "core" => Ok(ScenarioKind::CORE.to_vec()),
         "enterprise" => Ok(ScenarioKind::ENTERPRISE.to_vec()),
+        "scanner" => Ok(ScenarioKind::SCANNER.to_vec()),
         "replication" => Ok(vec![
             ScenarioKind::SiteReplication,
             ScenarioKind::BucketReplication,

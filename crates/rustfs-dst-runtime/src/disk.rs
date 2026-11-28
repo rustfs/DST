@@ -374,11 +374,22 @@ impl SimDiskInner {
     }
 
     fn total_volatile_bytes(&self) -> u64 {
-        self.inodes
-            .values()
-            .filter(|inode| !inode.is_dir)
-            .map(|inode| inode.volatile_data.len() as u64)
-            .sum()
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![self.root];
+        let mut total = 0u64;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(inode) = self.inodes.get(&id) {
+                if inode.is_dir {
+                    stack.extend(inode.volatile_children.values().copied());
+                } else {
+                    total += inode.volatile_data.len() as u64;
+                }
+            }
+        }
+        total
     }
 
     fn crash_and_reboot(&mut self) {
@@ -546,6 +557,51 @@ impl SimDiskIo {
         }
         inode.volatile_data = bytes;
         true
+    }
+
+    /// Deterministically truncate `trim_bytes` from the tail of `path` on both
+    /// volatile and durable layers (simulating silent tail-truncation corruption,
+    /// e.g. `rustfs/rustfs#8005`). Returns `true` if the file was shrunk.
+    pub fn inject_tail_truncate(&self, path: &str, trim_bytes: usize) -> bool {
+        if trim_bytes == 0 {
+            return false;
+        }
+        let Ok(norm) = normalize_path(path) else {
+            return false;
+        };
+        let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
+        let Some(id) = inner.lookup(&norm, false) else {
+            return false;
+        };
+        let Some(existing) = inner.inodes.get(&id).and_then(|inode| {
+            if inode.is_dir || inode.volatile_data.len() <= trim_bytes {
+                None
+            } else {
+                Some(inode.volatile_data.clone())
+            }
+        }) else {
+            return false;
+        };
+        let new_len = existing.len() - trim_bytes;
+        let truncated = existing.slice(..new_len);
+        let inode = inner.inodes.get_mut(&id).expect("inode");
+        if inode
+            .durable_data
+            .as_ref()
+            .is_some_and(|durable| durable.len() == existing.len())
+        {
+            inode.durable_data = Some(truncated.clone());
+        }
+        inode.volatile_data = truncated;
+        true
+    }
+
+    /// Return current total volatile byte usage across all files on this drive.
+    pub fn used_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("SimDiskIo lock poisoned")
+            .total_volatile_bytes()
     }
 
     /// Wipe the entire drive (simulating drive replacement with a fresh empty disk).
@@ -956,9 +1012,32 @@ mod tests {
             disk.read_file("bucket/obj/xl.meta").await.unwrap(),
             Bytes::from_static(b"v1")
         );
-        assert!(matches!(
+        assert_eq!(
             disk.read_file("bucket/obj/xl.meta.next").await,
-            Err(DiskError::NotFound(_))
-        ));
+            Err(DiskError::NotFound("bucket/obj/xl.meta.next".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_truncate_shrinks_persisted_bytes() {
+        let disk = SimDiskIo::new("d1", SimRng::from_seed(101));
+        let payload = Bytes::from_static(b"rustfs-shard-0123456789");
+        disk.write_file("b/k/part.1", payload.clone())
+            .await
+            .unwrap();
+        disk.fsync_file("b/k/part.1").await.unwrap();
+        disk.fsync_dir("b/k").await.unwrap();
+
+        assert!(disk.inject_tail_truncate("b/k/part.1", 1));
+        assert_eq!(
+            disk.read_file("b/k/part.1").await.unwrap().len(),
+            payload.len() - 1
+        );
+        assert_eq!(disk.used_bytes(), (payload.len() - 1) as u64);
+        disk.crash_and_reboot();
+        assert_eq!(
+            disk.read_file("b/k/part.1").await.unwrap().len(),
+            payload.len() - 1
+        );
     }
 }

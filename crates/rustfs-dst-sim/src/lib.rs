@@ -22,6 +22,7 @@ pub mod lock;
 pub mod oracle;
 pub mod pools;
 pub mod replication;
+pub mod scanner;
 pub mod scenarios;
 pub mod security_obs;
 pub mod topology;
