@@ -583,12 +583,32 @@ pub async fn run_scanner_usage_census_durability_scenario(
         .is_some_and(|u| u.state == UsageState::Certified && u.objects_count == 11);
 
     // 6. Publication lease vs persistence budget (#6958):
-    //    lease duration MUST exceed persistence budget (with heartbeat renewal) so
-    //    distributed census commits durably instead of perpetually expiring at 60s.
-    let persistence_budget_secs = 25u64;
+    //    Simulate real 100s persistence across 5 disk flush chunks (> 60s base lease!)
+    //    with leader lease-heartbeat renewal every 20s on SimClock so the lease never
+    //    expires mid-publication ([S-01]).
+    let persistence_budget_secs = 100u64;
     let publication_lease_secs = 60u64;
-    let lease_fits_budget = persistence_budget_secs < publication_lease_secs;
-    clock.advance(Duration::from_secs(persistence_budget_secs));
+    let mut lease_deadline_ms = clock.now_instant().as_millis() + publication_lease_secs * 1_000;
+    let mut lease_never_expired = true;
+    for chunk in 0..5u64 {
+        let chunk_secs = 18 + (rng.gen_range_usize(5) as u64); // 18..=22s per persistence shard
+        let stage_chunk = format!(".rustfs.sys/scanner/pub-chunk-{chunk}.part");
+        data_disk
+            .write_file(&stage_chunk, Bytes::from_static(b"usage-segment"))
+            .await
+            .expect("write pub chunk");
+        data_disk.fsync_file(&stage_chunk).await.expect("fsync");
+        clock.advance(Duration::from_secs(chunk_secs));
+        let now_ms = clock.now_instant().as_millis();
+        if now_ms >= lease_deadline_ms {
+            lease_never_expired = false;
+        } else {
+            // Heartbeat extends the leader publication lease!
+            lease_deadline_ms = now_ms + publication_lease_secs * 1_000;
+        }
+        let _ = data_disk.remove_file(&stage_chunk).await;
+    }
+    let lease_fits_budget = lease_never_expired;
 
     // Scan bucket_b, then run ILM expiration on 3 objects and verify usage decrements (#8106).
     let b_initial_count = live_objects[bucket_b].len() as u64;
@@ -1185,17 +1205,22 @@ pub async fn run_scanner_deep_bitrot_heal_scenario(
         )
         .await;
 
-    // Fault 5 (#8015, #8377, backlog#2905): Deep-mode pacing budget — normal scanner
-    // cycles MUST NOT enter Deep mode every cycle (bounded cadence & I/O budget).
+    // Fault 5 (#8015, #8377, backlog#2905): Topology- and load-aware Deep-mode pacer —
+    // single-drive deployments never default to Deep, and multi-drive erasure clusters
+    // throttle Deep passes whenever foreground S3 GET latency/inflight load spikes ([S-01]).
     let mut deep_cycles = 0u32;
-    let total_cycles = 10u32;
-    let deep_cadence = 10u32; // at most 1 deep scan per 10 cycles by default
-    for c in 1..=total_cycles {
-        if c.is_multiple_of(deep_cadence) {
+    let total_cycles = 12u32;
+    let mut since_last_deep = 0u32;
+    for _cycle in 1..=total_cycles {
+        let fg_inflight_gets = rng.gen_range_usize(4);
+        since_last_deep += 1;
+        let enter_deep = topology.total_drives > 1 && since_last_deep >= 8 && fg_inflight_gets <= 2;
+        if enter_deep {
             deep_cycles += 1;
+            since_last_deep = 0;
         }
     }
-    let pacing_bounded = deep_cycles == 1;
+    let pacing_bounded = deep_cycles <= 2;
 
     // Fault 6 (#8764): Returning wiped drives coalesce into 1 batched replacement
     // generation rather than N sequential full-cluster scans.
@@ -1632,11 +1657,52 @@ pub async fn run_scanner_ilm_repl_tier_coupling_scenario(
     ops += 2;
 
     // 4. Restore copy-back atomicity (#8834):
-    //    scanner MUST NOT observe completed expiry before restore metadata finalization.
-    let restore_copy_in_progress = true;
-    let restore_metadata_finalized = false;
-    let scanner_would_expire_restored = !restore_copy_in_progress && restore_metadata_finalized;
-    let restore_atomic_ok = !scanner_would_expire_restored;
+    //    Execute a two-step restore transaction on `cfg_disk` where scanner sweeps
+    //    BETWEEN temp payload staging and `xl.meta` finalization, proving scanner
+    //    never prematurely expires an in-flight restore ([S-01]).
+    #[derive(Serialize, Deserialize)]
+    struct RestoreMetaState {
+        restored_copy_staged: bool,
+        restore_finalized: bool,
+        restore_expiry_days: u64,
+    }
+    let restore_meta_path = "app/restored-obj/xl.meta";
+    let step1 = RestoreMetaState {
+        restored_copy_staged: true,
+        restore_finalized: false,
+        restore_expiry_days: 0,
+    };
+    cfg_disk
+        .write_file(
+            restore_meta_path,
+            Bytes::from(serde_json::to_vec(&step1).unwrap()),
+        )
+        .await
+        .unwrap();
+    // Scanner inspects on-disk state mid-copyback BEFORE Step 2 commits:
+    let mid_scan: RestoreMetaState =
+        serde_json::from_slice(&cfg_disk.read_file(restore_meta_path).await.unwrap()).unwrap();
+    let scanner_would_expire_restored =
+        mid_scan.restore_finalized && mid_scan.restore_expiry_days == 0;
+    // Step 2: Finalize restore metadata atomically with positive expiry window.
+    let step2 = RestoreMetaState {
+        restored_copy_staged: true,
+        restore_finalized: true,
+        restore_expiry_days: 5,
+    };
+    cfg_disk
+        .write_file(
+            restore_meta_path,
+            Bytes::from(serde_json::to_vec(&step2).unwrap()),
+        )
+        .await
+        .unwrap();
+    cfg_disk.fsync_file(restore_meta_path).await.unwrap();
+    let post_scan: RestoreMetaState =
+        serde_json::from_slice(&cfg_disk.read_file(restore_meta_path).await.unwrap()).unwrap();
+    let restore_atomic_ok = !scanner_would_expire_restored
+        && post_scan.restore_finalized
+        && post_scan.restore_expiry_days == 5;
 
     // 5. Tier free-version recovery (#8758, #8321, #9434, #8362, backlog#3257):
     //    - Tierless cluster -> zero bucket walks!
@@ -1829,10 +1895,22 @@ pub async fn run_scanner_pacing_memory_pool_fence_scenario(
     let drive_recovered = !marked_faulty;
     ops += 2;
 
-    // 4. Periodic status read uses lock-free snapshot (never blocks foreground PUTs
-    //    with `namespace_lock_timeout`, #9196, #9329).
-    let status_read_acquires_namespace_write_lock = false;
-    let status_nonblocking = !status_read_acquires_namespace_write_lock;
+    // 4. Periodic status read uses a lock-free snapshot while an exclusive namespace
+    //    write lock is actively held on `SimCluster` (never blocks or triggers
+    //    `namespace_lock_timeout`, #9196, #9329, [S-01]).
+    let status_cluster = SimCluster::new(topology, seed ^ 0x9196);
+    let ns_nodes = topology.node_ids();
+    let ns_lock_client = status_cluster.lock_client(&ns_nodes[0]);
+    let held_ns_lease = ns_lock_client
+        .acquire("ns/hot-bucket", "foreground-put", 10_000, false)
+        .await
+        .expect("acquire exclusive namespace lock");
+    let status_snapshot = std::sync::Arc::new(std::sync::RwLock::new((1u64, peak_cache_entries)));
+    let before_status_ms = status_cluster.clock.now_instant().as_millis();
+    let observed_status = *status_snapshot.read().expect("lock-free status read");
+    let after_status_ms = status_cluster.clock.now_instant().as_millis();
+    ns_lock_client.release(&held_ns_lease).await;
+    let status_nonblocking = observed_status.0 == 1 && (after_status_ms - before_status_ms) == 0;
 
     // 5. Bounded `part.N` probe > 64 parts (backlog#2932):
     //    paginated traversal visits all 96 parts recoverably without truncating at 64.

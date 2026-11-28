@@ -268,6 +268,12 @@ fn main() -> ExitCode {
                 }
             }
 
+            let unhit = if seeds >= 5 {
+                aggregate_probes.unhit_must_hit()
+            } else {
+                Vec::new()
+            };
+
             if json {
                 let summary = serde_json::json!({
                     "topology": topology.to_string(),
@@ -280,6 +286,7 @@ fn main() -> ExitCode {
                     "failed_runs": failures.len(),
                     "total_operations": total_ops,
                     "probes": aggregate_probes.snapshot(),
+                    "unhit_must_hit_probes": unhit,
                     "failures": failures,
                 });
                 println!(
@@ -306,6 +313,12 @@ fn main() -> ExitCode {
                         );
                     }
                 }
+                for st in &unhit {
+                    eprintln!(
+                        "UNHIT MUST-HIT PROBE: [{:?}] {} had pass_count=0 across {seeds} seeds",
+                        st.kind, st.id
+                    );
+                }
                 for fail in &failures {
                     eprintln!(
                         "FAILURE: scenario={} topology={} seed={} -> repro: rustfs-dst repro --scenario {} --topology {} --seed {}",
@@ -322,7 +335,7 @@ fn main() -> ExitCode {
                 }
             }
 
-            if failures.is_empty() {
+            if failures.is_empty() && unhit.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE

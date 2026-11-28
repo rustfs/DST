@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 
+const METHOD_DISK_STAGE: &str = "rustfs.disk.StageShard";
 const METHOD_DISK_COMMIT: &str = "rustfs.disk.CommitShard";
 const METHOD_DISK_ROLLBACK: &str = "rustfs.disk.RollbackMeta";
 const METHOD_DISK_READ: &str = "rustfs.disk.ReadShard";
@@ -246,22 +247,29 @@ impl NodeRpcServer {
             .ok_or_else(|| NetError::Io(format!("invalid drive_idx {idx}")))
     }
 
-    async fn handle_commit(&self, req: CommitShardReq) -> Result<RpcFrame, NetError> {
+    async fn handle_stage(&self, req: CommitShardReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
         let full_key = format!("{}/{}", req.meta.bucket, req.meta.key);
         let tmp_dir = format!(".rustfs.sys/tmp/{}", req.tx_id);
         let tmp_part = format!("{tmp_dir}/part.1");
         let tmp_meta = format!("{tmp_dir}/xl.meta");
-        let obj_dir = format!("{}/{}", req.meta.bucket, req.meta.key);
-        let ver_dir = format!("{obj_dir}/{}", req.meta.version_id);
-        let dst_part = format!("{ver_dir}/part.1");
-        let dst_meta = format!("{obj_dir}/xl.meta");
-        let bkp_meta = format!("{obj_dir}/xl.meta.bkp");
+        let dst_meta = format!("{}/{}/xl.meta", req.meta.bucket, req.meta.key);
+
+        // Reject stale generation writes upfront (generation fence on disk).
+        if let Ok(existing_bytes) = disk.read_file(&dst_meta).await
+            && let Ok(existing_meta) = serde_json::from_slice::<XlMeta>(&existing_bytes)
+            && existing_meta.generation >= req.meta.generation
+        {
+            return Err(NetError::Io(format!(
+                "stale generation {} <= existing {}",
+                req.meta.generation, existing_meta.generation
+            )));
+        }
 
         let meta_bytes =
             Bytes::from(serde_json::to_vec(&req.meta).map_err(|e| NetError::Io(e.to_string()))?);
 
-        // Step 1: Stage shard + xl.meta in `.rustfs.sys/tmp/<tx_id>` and fsync.
+        // Phase 1: Stage shard + xl.meta in `.rustfs.sys/tmp/<tx_id>` and fsync.
         disk.create_dir_all(&tmp_dir)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
@@ -279,6 +287,7 @@ impl NodeRpcServer {
         disk.fsync_file(&tmp_meta)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
+        let _ = disk.fsync_dir(&tmp_dir).await;
 
         // Crash window: MetaWriteAfterTmpBeforeRename (pre-commit).
         if self
@@ -302,6 +311,21 @@ impl NodeRpcServer {
             ));
         }
 
+        Ok(RpcFrame::new(METHOD_DISK_STAGE, Vec::new()))
+    }
+
+    async fn handle_commit(&self, req: CommitShardReq) -> Result<RpcFrame, NetError> {
+        let disk = self.disk(req.drive_idx)?;
+        let full_key = format!("{}/{}", req.meta.bucket, req.meta.key);
+        let tmp_dir = format!(".rustfs.sys/tmp/{}", req.tx_id);
+        let tmp_part = format!("{tmp_dir}/part.1");
+        let tmp_meta = format!("{tmp_dir}/xl.meta");
+        let obj_dir = format!("{}/{}", req.meta.bucket, req.meta.key);
+        let ver_dir = format!("{obj_dir}/{}", req.meta.version_id);
+        let dst_part = format!("{ver_dir}/part.1");
+        let dst_meta = format!("{obj_dir}/xl.meta");
+        let bkp_meta = format!("{obj_dir}/xl.meta.bkp");
+
         // Reject stale generation writes (generation fence on disk).
         if let Ok(existing_bytes) = disk.read_file(&dst_meta).await
             && let Ok(existing_meta) = serde_json::from_slice::<XlMeta>(&existing_bytes)
@@ -314,7 +338,7 @@ impl NodeRpcServer {
             )));
         }
 
-        // Step 2: Publish data shard into versioned directory.
+        // Step 2: Publish staged data shard into versioned directory.
         disk.create_dir_all(&obj_dir)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
@@ -398,8 +422,6 @@ impl NodeRpcServer {
         }
 
         // Step 6: Clean up temp dir (unless buggify leaves an orphan for GC).
-        // Preserve `xl.meta.bkp` so coordinator-driven write-quorum rollback can
-        // cleanly restore the previous committed version if write quorum fails.
         if !self
             .buggify
             .should_fire_with_prob("ecstore.skip_tmp_cleanup", 0.15)
@@ -425,9 +447,14 @@ impl NodeRpcServer {
                 let _ = disk.write_file(&dst_meta, bkp_bytes).await;
                 let _ = disk.fsync_file(&dst_meta).await;
                 let _ = disk.remove_file(&bkp_meta).await;
-            } else if req.failed_generation == 1 {
+            } else {
+                // Unconditionally remove `dst_meta` even when `failed_generation > 1`
+                // on a drive that missed earlier generations ([D-03]).
                 let _ = disk.remove_file(&dst_meta).await;
             }
+            let _ = disk
+                .remove_dir_all(&format!("{obj_dir}/{}", cur_meta.version_id))
+                .await;
             let _ = disk.fsync_dir(&obj_dir).await;
         }
         Ok(RpcFrame::new(METHOD_DISK_ROLLBACK, Vec::new()))
@@ -626,6 +653,11 @@ impl RpcHandler for NodeRpcServer {
     async fn handle(&self, from: &str, request: RpcFrame) -> Result<RpcFrame, NetError> {
         match request.method.as_str() {
             METHOD_LOCK_ACQUIRE | METHOD_LOCK_RELEASE => self.locks.handle(from, request).await,
+            METHOD_DISK_STAGE => {
+                let req: CommitShardReq = serde_json::from_slice(&request.payload)
+                    .map_err(|e| NetError::Io(e.to_string()))?;
+                self.handle_stage(req).await
+            }
             METHOD_DISK_COMMIT => {
                 let req: CommitShardReq = serde_json::from_slice(&request.payload)
                     .map_err(|e| NetError::Io(e.to_string()))?;
@@ -879,9 +911,11 @@ impl SimCluster {
         key: &str,
         include_data: bool,
     ) -> (usize, Vec<(usize, XlMeta, Option<Vec<u8>>)>) {
-        let mut responded = 0usize;
-        let mut found = Vec::new();
-        for (node_id, drive_idx, global_idx) in self.drive_slots() {
+        let slots = self.drive_slots();
+        let mut join_set = tokio::task::JoinSet::new();
+        for (ord, (node_id, drive_idx, global_idx)) in slots.into_iter().enumerate() {
+            let net = self.network.clone();
+            let caller = via_node.to_string();
             let req = ReadShardReq {
                 drive_idx,
                 bucket: bucket.to_string(),
@@ -889,10 +923,23 @@ impl SimCluster {
                 include_data,
             };
             let payload = serde_json::to_vec(&req).expect("serialize ReadShardReq");
-            if let Ok(frame) = self
-                .network
-                .call(via_node, &node_id, RpcFrame::new(METHOD_DISK_READ, payload))
-                .await
+            join_set.spawn(async move {
+                let res = net
+                    .call(&caller, &node_id, RpcFrame::new(METHOD_DISK_READ, payload))
+                    .await;
+                (ord, node_id, drive_idx, global_idx, res)
+            });
+        }
+        let mut ordered = vec![None; self.topology.total_drives];
+        while let Some(Ok((ord, node_id, drive_idx, global_idx, res))) = join_set.join_next().await
+        {
+            ordered[ord] = Some((node_id, drive_idx, global_idx, res));
+        }
+
+        let mut responded = 0usize;
+        let mut found = Vec::new();
+        for (node_id, drive_idx, global_idx, res) in ordered.into_iter().flatten() {
+            if let Ok(frame) = res
                 && let Ok(resp) = serde_json::from_slice::<ReadShardResp>(&frame.payload)
             {
                 responded += 1;
@@ -1015,18 +1062,15 @@ impl SimCluster {
             .map_err(|e| StoreError::Internal(e.to_string()))?
         };
 
-        let mut acked = 0usize;
-        let mut reply_dropped = 0usize;
-        let mut committed_slots = Vec::new();
-
-        for (node_id, drive_idx, global_idx) in self.drive_slots() {
+        let slots = self.drive_slots();
+        let mut req_payloads = Vec::with_capacity(slots.len());
+        for (node_id, drive_idx, global_idx) in &slots {
             let (shard_bytes, shard_sha256) = if is_delete_marker {
                 (Vec::new(), String::new())
             } else {
-                let s = &shards[global_idx];
+                let s = &shards[*global_idx];
                 (s.bytes.clone(), s.sha256_hex.clone())
             };
-
             let meta = XlMeta {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -1035,26 +1079,91 @@ impl SimCluster {
                 is_delete_marker,
                 orig_len: payload.len(),
                 payload_sha256: payload_sha256.clone(),
-                shard_index: global_idx,
+                shard_index: *global_idx,
                 shard_sha256,
             };
             let req = CommitShardReq {
-                drive_idx,
+                drive_idx: *drive_idx,
                 tx_id: tx_id.clone(),
                 meta,
                 shard_bytes,
                 is_multipart_commit,
             };
-            let req_bytes = serde_json::to_vec(&req).expect("serialize CommitShardReq");
-            match self
-                .network
-                .call(
-                    via_node,
-                    &node_id,
-                    RpcFrame::new(METHOD_DISK_COMMIT, req_bytes),
-                )
-                .await
-            {
+            req_payloads.push((
+                node_id.clone(),
+                *drive_idx,
+                serde_json::to_vec(&req).expect("serialize CommitShardReq"),
+            ));
+        }
+
+        // Phase 1: Stage shards in `.rustfs.sys/tmp/<tx_id>` concurrently across all drives.
+        // If staging fails to reach write quorum, abort BEFORE renaming `xl.meta` on any drive!
+        let mut stage_join = tokio::task::JoinSet::new();
+        for (ord, (node_id, drive_idx, req_bytes)) in req_payloads.iter().cloned().enumerate() {
+            let net = self.network.clone();
+            let caller = via_node.to_string();
+            stage_join.spawn(async move {
+                let res = net
+                    .call(
+                        &caller,
+                        &node_id,
+                        RpcFrame::new(METHOD_DISK_STAGE, req_bytes),
+                    )
+                    .await;
+                (ord, node_id, drive_idx, res)
+            });
+        }
+        let mut stage_results = vec![None; req_payloads.len()];
+        while let Some(Ok((ord, node_id, drive_idx, res))) = stage_join.join_next().await {
+            stage_results[ord] = Some((node_id, drive_idx, res));
+        }
+
+        let mut staged_indices = Vec::new();
+        for (ord, (_node_id, _drive_idx, res)) in stage_results.into_iter().flatten().enumerate() {
+            if matches!(res, Ok(_) | Err(NetError::ReplyDroppedAfterApply { .. })) {
+                staged_indices.push(ord);
+            }
+        }
+
+        if staged_indices.len() < self.topology.write_quorum {
+            self.probes.reachable(
+                "ecstore.write_quorum_rollback",
+                json!({"key": resource, "acked": staged_indices.len(), "required": self.topology.write_quorum}),
+            );
+            lock_client.release(&lease).await;
+            return Err(StoreError::WriteQuorumNotMet {
+                acked: staged_indices.len(),
+                required: self.topology.write_quorum,
+            });
+        }
+
+        // Phase 2: Publish `xl.meta` concurrently across all staged drives.
+        let mut commit_join = tokio::task::JoinSet::new();
+        for ord in staged_indices {
+            let (node_id, drive_idx, req_bytes) = req_payloads[ord].clone();
+            let net = self.network.clone();
+            let caller = via_node.to_string();
+            commit_join.spawn(async move {
+                let res = net
+                    .call(
+                        &caller,
+                        &node_id,
+                        RpcFrame::new(METHOD_DISK_COMMIT, req_bytes),
+                    )
+                    .await;
+                (ord, node_id, drive_idx, res)
+            });
+        }
+        let mut commit_results = vec![None; req_payloads.len()];
+        while let Some(Ok((ord, node_id, drive_idx, res))) = commit_join.join_next().await {
+            commit_results[ord] = Some((node_id, drive_idx, res));
+        }
+
+        let mut acked = 0usize;
+        let mut reply_dropped = 0usize;
+        let mut committed_slots = Vec::new();
+        for (node_id, drive_idx, res) in commit_results.into_iter().flatten() {
+            match res {
                 Ok(_) => {
                     acked += 1;
                     committed_slots.push((node_id, drive_idx));
@@ -1156,21 +1265,29 @@ impl SimCluster {
         // healthy shards, including a write that reached exactly that many and
         // then failed the higher write quorum. A newer version that cannot have
         // been committed and cannot be reconstructed must not hide the older one.
+        let mut skipped_higher_votes = 0usize;
         for (_gen, top_entries) in by_gen.into_iter().rev() {
             let canonical = &top_entries[0].1;
             let votes = top_entries.len();
-            let max_possible = votes + unreachable;
+            // Drives holding higher generations that were already proven to be
+            // uncommitted orphans previously held an older generation (or were empty).
+            let max_possible = votes + skipped_higher_votes + unreachable;
+
+            // Any version (delete marker OR data object) whose cumulative support
+            // `votes + skipped_higher_votes + unreachable < write_quorum` provably
+            // never reached write quorum ([D-01]).
+            if max_possible < self.topology.write_quorum {
+                skipped_higher_votes += votes;
+                self.probes.reachable(
+                    "ecstore.skipped_provably_uncommitted_orphan",
+                    json!({"bucket": bucket, "key": key, "orphan_gen": canonical.generation}),
+                );
+                continue;
+            }
 
             if canonical.is_delete_marker {
-                if votes >= self.topology.write_quorum {
+                if votes + skipped_higher_votes >= self.topology.write_quorum {
                     return Err(StoreError::NotFound(format!("{bucket}/{key}")));
-                }
-                if max_possible < self.topology.write_quorum {
-                    self.probes.reachable(
-                        "ecstore.skipped_provably_uncommitted_orphan",
-                        json!({"bucket": bucket, "key": key, "orphan_gen": canonical.generation}),
-                    );
-                    continue;
                 }
                 return Err(StoreError::ReadQuorumNotMet {
                     healthy: votes,
@@ -1295,20 +1412,22 @@ impl SimCluster {
             gens.dedup();
             let mut choice: Option<&XlMeta> = None;
             let mut ambiguous = false;
+            let mut skipped_higher_votes = 0usize;
             for generation in gens.into_iter().rev() {
                 let top: Vec<&XlMeta> = metas
                     .iter()
                     .filter(|meta| meta.generation == generation)
                     .collect();
                 let votes = top.len();
-                let max_possible = votes + unreachable;
+                let max_possible = votes + skipped_higher_votes + unreachable;
+                if max_possible < self.topology.write_quorum {
+                    skipped_higher_votes += votes;
+                    continue;
+                }
                 if top[0].is_delete_marker {
-                    if votes >= self.topology.write_quorum {
+                    if votes + skipped_higher_votes >= self.topology.write_quorum {
                         choice = None;
                         break;
-                    }
-                    if max_possible < self.topology.write_quorum {
-                        continue;
                     }
                     ambiguous = true;
                     break;
@@ -1317,7 +1436,8 @@ impl SimCluster {
                     choice = Some(top[0]);
                     break;
                 }
-                if max_possible < self.topology.read_quorum {
+                if votes + unreachable < self.topology.read_quorum {
+                    skipped_higher_votes += votes;
                     continue;
                 }
                 ambiguous = true;
@@ -1579,8 +1699,18 @@ impl SimCluster {
         // provably uncommitted orphan and will be reconciled.
         let mut selected: Option<(XlMeta, BTreeMap<usize, Vec<u8>>, bool)> = None;
         let mut skipped_orphan = false;
+        let mut skipped_higher_votes = 0usize;
         for (_gen, entries) in by_gen.into_iter().rev() {
             let canonical = &entries[0].1;
+            let votes = entries.len();
+            // On `k == m` (`3x2`, `4x2`), `data_shards < write_quorum`: any generation
+            // with `votes + skipped_higher_votes + unreachable < write_quorum` provably
+            // failed write quorum and MUST be rolled back / overwritten ([D-01]).
+            if votes + skipped_higher_votes + unreachable < self.topology.write_quorum {
+                skipped_orphan = true;
+                skipped_higher_votes += votes;
+                continue;
+            }
             let mut healthy_by_slot: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
             for (global_idx, meta, maybe_bytes) in &entries {
                 if canonical.is_delete_marker {
@@ -1592,9 +1722,9 @@ impl SimCluster {
                 }
             }
             let min_needed = if canonical.is_delete_marker {
-                // Same threshold as GET early-stop: a sub-write-quorum delete
-                // marker must not be healed into a durable deletion.
-                self.topology.write_quorum
+                self.topology
+                    .write_quorum
+                    .saturating_sub(skipped_higher_votes)
             } else {
                 self.topology.data_shards
             };
@@ -1602,8 +1732,9 @@ impl SimCluster {
                 selected = Some((canonical.clone(), healthy_by_slot, skipped_orphan));
                 break;
             }
-            if entries.len() + unreachable < min_needed {
+            if healthy_by_slot.len() + unreachable < min_needed {
                 skipped_orphan = true;
+                skipped_higher_votes += votes;
                 continue;
             }
             return Err(StoreError::ReadQuorumNotMet {
@@ -1955,5 +2086,163 @@ mod tests {
             .expect("complete replacement");
         let got = cluster.get_object("n2", "bkt", "obj").await.expect("get");
         assert_eq!(got.payload, b"new-part-with-different-length");
+    }
+
+    #[tokio::test]
+    async fn sub_write_quorum_data_version_does_not_shadow_older_object_or_get_healed() {
+        // 3x2: N=6, k=3, m=3, R=3, W=4. Planting 3 valid shards of v2 (< W=4)
+        // must NEVER shadow v1 in GET/LIST or get promoted by heal_object ([D-01]).
+        let cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 21);
+        let v1 = b"committed-v1-payload";
+        let put1 = cluster
+            .put_object("n1", "bkt", "obj", v1, PutConditions::default())
+            .await
+            .expect("put v1");
+
+        let v2 = b"uncommitted-v2-payload";
+        let shards_v2 = encode(v2, 3, 3).expect("encode v2");
+        for (node_id, drive_idx, global_idx) in cluster.drive_slots().into_iter().take(3) {
+            let disk = &cluster.nodes[&node_id].disks[drive_idx];
+            let ver_id = "orphan-v2".to_string();
+            let part_path = format!("bkt/obj/{ver_id}/part.1");
+            disk.write_file(&part_path, Bytes::from(shards_v2[global_idx].bytes.clone()))
+                .await
+                .unwrap();
+            let meta = XlMeta {
+                bucket: "bkt".into(),
+                key: "obj".into(),
+                version_id: ver_id,
+                generation: put1.generation + 1,
+                is_delete_marker: false,
+                orig_len: v2.len(),
+                payload_sha256: sha256_hex(v2),
+                shard_index: global_idx,
+                shard_sha256: shards_v2[global_idx].sha256_hex.clone(),
+            };
+            disk.write_file(
+                "bkt/obj/xl.meta",
+                Bytes::from(serde_json::to_vec(&meta).unwrap()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let got = cluster
+            .get_object("n2", "bkt", "obj")
+            .await
+            .expect("v1 readable");
+        assert_eq!(got.payload, v1);
+        assert_eq!(got.generation, put1.generation);
+
+        let listed = cluster.list_objects("n1", "bkt").await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].generation, put1.generation);
+
+        cluster
+            .heal_object("n1", "bkt", "obj")
+            .await
+            .expect("heal rolls back orphan v2");
+        let errors = cluster
+            .verify_cluster_convergence("bkt", &["obj".to_string()])
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let after_heal = cluster
+            .get_object("n3", "bkt", "obj")
+            .await
+            .expect("after heal");
+        assert_eq!(after_heal.payload, v1);
+    }
+
+    #[tokio::test]
+    async fn rollback_cleans_uncommitted_meta_when_drive_missed_first_generation() {
+        let cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 22);
+        // Take n3:data2 offline during gen=1 so it has no xl.meta and no xl.meta.bkp.
+        cluster.set_drive_offline("n3", 1, true);
+        cluster
+            .put_object("n1", "bkt", "obj", b"v1", PutConditions::default())
+            .await
+            .expect("v1 degraded put");
+        cluster.set_drive_offline("n3", 1, false);
+
+        // Plant failed gen=2 directly on n3:data2 (which has no xl.meta.bkp) and invoke rollback.
+        let disk = &cluster.nodes["n3"].disks[1];
+        let meta = XlMeta {
+            bucket: "bkt".into(),
+            key: "obj".into(),
+            version_id: "failed-g2".into(),
+            generation: 2,
+            is_delete_marker: false,
+            orig_len: 2,
+            payload_sha256: sha256_hex(b"v2"),
+            shard_index: 5,
+            shard_sha256: sha256_hex(b"v2"),
+        };
+        disk.write_file(
+            "bkt/obj/xl.meta",
+            Bytes::from(serde_json::to_vec(&meta).unwrap()),
+        )
+        .await
+        .unwrap();
+        let rb = RollbackMetaReq {
+            drive_idx: 1,
+            bucket: "bkt".into(),
+            key: "obj".into(),
+            failed_generation: 2,
+        };
+        cluster
+            .network
+            .call(
+                "n1",
+                "n3",
+                RpcFrame::new(METHOD_DISK_ROLLBACK, serde_json::to_vec(&rb).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            disk.read_file("bkt/obj/xl.meta").await,
+            Err(DiskError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_with_if_match_cas_serialize_linearizably() {
+        let cluster = Arc::new(SimCluster::new(TopologyKind::FourByFour.spec(), 23));
+        let init = cluster
+            .put_object("n1", "bkt", "cas-key", b"base", PutConditions::default())
+            .await
+            .expect("seed base");
+
+        let c_a = Arc::clone(&cluster);
+        let c_b = Arc::clone(&cluster);
+        let etag_a = init.payload_sha256.clone();
+        let etag_b = init.payload_sha256;
+
+        let (res_a, res_b) = tokio::join!(
+            c_a.put_object(
+                "n1",
+                "bkt",
+                "cas-key",
+                b"writer-a",
+                PutConditions {
+                    if_match_sha256: Some(etag_a),
+                    if_none_match_any: false,
+                }
+            ),
+            c_b.put_object(
+                "n2",
+                "bkt",
+                "cas-key",
+                b"writer-b",
+                PutConditions {
+                    if_match_sha256: Some(etag_b),
+                    if_none_match_any: false,
+                }
+            )
+        );
+        let successes = usize::from(res_a.is_ok()) + usize::from(res_b.is_ok());
+        assert_eq!(
+            successes, 1,
+            "expected exactly 1 CAS winner: a={res_a:?}, b={res_b:?}"
+        );
     }
 }
