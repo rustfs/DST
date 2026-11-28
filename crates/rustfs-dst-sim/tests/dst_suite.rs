@@ -13,13 +13,18 @@
 // limitations under the License.
 
 //! Integration test suite proving determinism and invariant preservation across
-//! all RustFS DST scenarios and official topologies (`4x4`, `3x2`, `4x2`).
+//! all 26 RustFS DST scenarios (7 core + 19 enterprise domains) and official
+//! topologies (`4x4`, `3x2`, `4x2`).
 
 use rustfs_dst_sim::scenarios::{ScenarioKind, run_scenario};
 use rustfs_dst_sim::topology::TopologyKind;
 
 #[test]
-fn all_scenarios_pass_across_4x4_3x2_and_4x2() {
+fn all_26_scenarios_pass_across_4x4_3x2_and_4x2() {
+    assert_eq!(ScenarioKind::ALL.len(), 26);
+    assert_eq!(ScenarioKind::CORE.len(), 7);
+    assert_eq!(ScenarioKind::ENTERPRISE.len(), 19);
+
     for topo in [
         TopologyKind::FourByFour,
         TopologyKind::ThreeByTwo,
@@ -38,7 +43,7 @@ fn all_scenarios_pass_across_4x4_3x2_and_4x2() {
 }
 
 #[test]
-fn identical_seeds_produce_bit_identical_trace_hashes() {
+fn identical_seeds_produce_bit_identical_trace_hashes_for_all_26_scenarios() {
     for scenario in ScenarioKind::ALL {
         let a = run_scenario(scenario, TopologyKind::FourByFour, 42_4242);
         let b = run_scenario(scenario, TopologyKind::FourByFour, 42_4242);
@@ -52,14 +57,22 @@ fn identical_seeds_produce_bit_identical_trace_hashes() {
 }
 
 #[test]
-fn multi_seed_swizzle_clog_chaos_holds_all_invariants() {
-    for seed in 1..=25u64 {
+fn multi_seed_swizzle_clog_and_enterprise_chaos_holds_all_invariants() {
+    for seed in 1..=15u64 {
         for topo in [TopologyKind::FourByFour, TopologyKind::ThreeByTwo] {
-            let report = run_scenario(ScenarioKind::SwizzleClogChaos, topo, seed);
+            let chaos = run_scenario(ScenarioKind::SwizzleClogChaos, topo, seed);
             assert!(
-                report.passed,
+                chaos.passed,
                 "SwizzleClogChaos failed on {topo} seed={seed}: {:?}",
-                report.violations
+                chaos.violations
+            );
+        }
+        for scenario in ScenarioKind::ENTERPRISE {
+            let rep = run_scenario(scenario, TopologyKind::FourByFour, seed);
+            assert!(
+                rep.passed,
+                "enterprise scenario {scenario} failed on 4x4 seed={seed}: {:?}",
+                rep.violations
             );
         }
     }

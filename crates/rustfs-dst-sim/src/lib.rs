@@ -15,9 +15,14 @@
 //! Simulated RustFS distributed storage engine and DST scenario library.
 
 pub mod ecstore;
+pub mod enterprise_data;
 pub mod erasure;
+pub mod governance;
 pub mod lock;
 pub mod oracle;
+pub mod pools;
+pub mod replication;
 pub mod scenarios;
+pub mod security_obs;
 pub mod topology;
 pub mod turmoil_cluster;

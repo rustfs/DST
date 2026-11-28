@@ -72,6 +72,7 @@ cargo run --release -p rustfs-dst-cli -- repro --scenario swizzle-clog-chaos --t
 
 ## Documentation
 
+- [Complete 26-Scenario Coverage Matrix (7 Core + 19 Enterprise Domains)](docs/coverage-matrix.md)
 - [Architecture & Upstream Trait Adoption Blueprint (`rustfs/rustfs`)](docs/architecture.md)
 - [Simulation Backends: In-Process, Turmoil, Madsim & Antithesis](docs/antithesis.md)
 - [Jepsen Distributed Verification Companion (`rustfs/Jepsen`)](https://github.com/rustfs/Jepsen)

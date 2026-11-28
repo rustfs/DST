@@ -74,12 +74,44 @@ enum Command {
 }
 
 fn parse_scenarios(raw: &str) -> Result<Vec<ScenarioKind>, String> {
-    if raw.eq_ignore_ascii_case("all") {
-        return Ok(ScenarioKind::ALL.to_vec());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "all" => Ok(ScenarioKind::ALL.to_vec()),
+        "core" => Ok(ScenarioKind::CORE.to_vec()),
+        "enterprise" => Ok(ScenarioKind::ENTERPRISE.to_vec()),
+        "replication" => Ok(vec![
+            ScenarioKind::SiteReplication,
+            ScenarioKind::BucketReplication,
+        ]),
+        "governance" => Ok(vec![
+            ScenarioKind::WormObjectLock,
+            ScenarioKind::LifecycleTransition,
+            ScenarioKind::LifecycleExpiration,
+            ScenarioKind::LifecycleTagExpiration,
+            ScenarioKind::TieringManagement,
+            ScenarioKind::TieredRemoteRestore,
+        ]),
+        "pools" => Ok(vec![
+            ScenarioKind::PoolExpansion,
+            ScenarioKind::PoolDecommission,
+            ScenarioKind::PoolRebalance,
+            ScenarioKind::DecommissionConsistencySafety,
+            ScenarioKind::RebalanceConsistencySafety,
+        ]),
+        "security" => Ok(vec![
+            ScenarioKind::OidcStsAuth,
+            ScenarioKind::BucketNotification,
+            ScenarioKind::AuditLogging,
+        ]),
+        "data" => Ok(vec![
+            ScenarioKind::S3Tables,
+            ScenarioKind::CapacityQuota,
+            ScenarioKind::OnDemandMigration,
+        ]),
+        _ => raw
+            .split(',')
+            .map(str::parse::<ScenarioKind>)
+            .collect::<Result<Vec<_>, _>>(),
     }
-    raw.split(',')
-        .map(str::parse::<ScenarioKind>)
-        .collect::<Result<Vec<_>, _>>()
 }
 
 fn main() -> ExitCode {

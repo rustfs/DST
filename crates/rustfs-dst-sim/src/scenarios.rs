@@ -19,7 +19,24 @@
 //! deterministic SHA-256 execution trace digest proving bit-for-bit replay.
 
 use crate::ecstore::{PutConditions, SimCluster, StoreError};
+use crate::enterprise_data::{
+    run_capacity_quota_scenario, run_on_demand_migration_scenario, run_s3_tables_scenario,
+};
+use crate::governance::{
+    run_lifecycle_expiration_scenario, run_lifecycle_tag_scenario,
+    run_lifecycle_transition_scenario, run_tiered_restore_scenario,
+    run_tiering_management_scenario, run_worm_scenario,
+};
 use crate::oracle::{ConsistencyOracle, InvariantViolation};
+use crate::pools::{
+    run_decommission_consistency_safety_scenario, run_pool_decommission_scenario,
+    run_pool_expansion_scenario, run_pool_rebalance_scenario,
+    run_rebalance_consistency_safety_scenario,
+};
+use crate::replication::{run_bucket_replication_scenario, run_site_replication_scenario};
+use crate::security_obs::{
+    run_audit_logging_scenario, run_bucket_notification_scenario, run_oidc_sts_scenario,
+};
 use crate::topology::{TopologyKind, TopologySpec};
 use crate::turmoil_cluster::run_turmoil_tcp_quorum_sim;
 use rustfs_dst_faults::crash::CrashPoint;
@@ -35,9 +52,10 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// All supported deterministic simulation scenarios.
+/// All supported deterministic simulation scenarios (7 core + 19 enterprise domains = 26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScenarioKind {
+    // --- Core Storage & Consensus Scenarios (7) ---
     /// Quorum PUT/GET/DELETE/If-Match under node loss & partitions.
     ErasureQuorum,
     /// Exhaustive RustFS `xl.meta` commit crash-point & un-fsynced power-loss matrix.
@@ -52,10 +70,50 @@ pub enum ScenarioKind {
     TurmoilTcpCluster,
     /// Full Swizzle-Clog chaos combining partitions, asymmetric cuts, clog, crashes, bitrot, and heal.
     SwizzleClogChaos,
+
+    // --- Enterprise Domain Scenarios (19) ---
+    /// #1 Multi-site active-active IAM/policy/bucket/object replication under partitions & skew.
+    SiteReplication,
+    /// #2 Async cross-cluster bucket version & delete-marker replication with out-of-order & loop guards.
+    BucketReplication,
+    /// #3 WORM Object Lock (COMPLIANCE, GOVERNANCE, Legal Hold) under hostile NTP clock jumps.
+    WormObjectLock,
+    /// #4 Virtual-clock lifecycle cold-tier transition racing with overwrites, outages, and crashes.
+    LifecycleTransition,
+    /// #5 Virtual-clock lifecycle expiration (current, noncurrent, delete markers, multipart, WORM).
+    LifecycleExpiration,
+    /// #6 Tag-based lifecycle management & expiration (`Prefix + Tag` AND-filter + TOCTOU re-tag barrier).
+    LifecycleTagExpiration,
+    /// #7 Live multi-pool expansion under concurrent S3 traffic and node restarts.
+    PoolExpansion,
+    /// #8 Pool decommission write-admission fence and full version drain under faults.
+    PoolDecommission,
+    /// #9 Multi-pool utilization rebalance under live reads/writes and crash resume.
+    PoolRebalance,
+    /// #10 Adversarial decommission data consistency & safety (overwrite/delete races, WORM, crash).
+    DecommissionConsistencySafety,
+    /// #11 Adversarial rebalance data consistency & safety (source bitrot healing, generation fence, crash).
+    RebalanceConsistencySafety,
+    /// #12 OIDC / STS JWT validation, rotating JWKS, IdP outage caching, and revocation.
+    OidcStsAuth,
+    /// #13 Bucket notification multi-target fan-out, filters, durable spill queue, and data-path isolation.
+    BucketNotification,
+    /// #14 Tamper-evident hash-chained audit logging, crash durability, and credential redaction.
+    AuditLogging,
+    /// #15 Remote tiering management, credential rotation, health flapping, and in-use deletion guard.
+    TieringManagement,
+    /// #16 Tiered remote data restore (`RestoreObject`), anti-rollback (#3074), and hot-cache TTL expiry.
+    TieredRemoteRestore,
+    /// #17 S3 Tables (Table Buckets, Namespaces, Iceberg `versionToken` CAS serializability).
+    S3Tables,
+    /// #18 Distributed HARD & FIFO capacity quotas (PUT, CopyObject, multipart reserve/abort, WORM safety).
+    CapacityQuota,
+    /// #19 On-demand lazy pull-through migration with local overwrite & tombstone shadowing.
+    OnDemandMigration,
 }
 
 impl ScenarioKind {
-    pub const ALL: [ScenarioKind; 7] = [
+    pub const CORE: [ScenarioKind; 7] = [
         ScenarioKind::ErasureQuorum,
         ScenarioKind::CrashConsistency,
         ScenarioKind::BitrotHeal,
@@ -63,6 +121,57 @@ impl ScenarioKind {
         ScenarioKind::DistributedLockSkew,
         ScenarioKind::TurmoilTcpCluster,
         ScenarioKind::SwizzleClogChaos,
+    ];
+
+    pub const ENTERPRISE: [ScenarioKind; 19] = [
+        ScenarioKind::SiteReplication,
+        ScenarioKind::BucketReplication,
+        ScenarioKind::WormObjectLock,
+        ScenarioKind::LifecycleTransition,
+        ScenarioKind::LifecycleExpiration,
+        ScenarioKind::LifecycleTagExpiration,
+        ScenarioKind::PoolExpansion,
+        ScenarioKind::PoolDecommission,
+        ScenarioKind::PoolRebalance,
+        ScenarioKind::DecommissionConsistencySafety,
+        ScenarioKind::RebalanceConsistencySafety,
+        ScenarioKind::OidcStsAuth,
+        ScenarioKind::BucketNotification,
+        ScenarioKind::AuditLogging,
+        ScenarioKind::TieringManagement,
+        ScenarioKind::TieredRemoteRestore,
+        ScenarioKind::S3Tables,
+        ScenarioKind::CapacityQuota,
+        ScenarioKind::OnDemandMigration,
+    ];
+
+    pub const ALL: [ScenarioKind; 26] = [
+        ScenarioKind::ErasureQuorum,
+        ScenarioKind::CrashConsistency,
+        ScenarioKind::BitrotHeal,
+        ScenarioKind::MultipartCommit,
+        ScenarioKind::DistributedLockSkew,
+        ScenarioKind::TurmoilTcpCluster,
+        ScenarioKind::SwizzleClogChaos,
+        ScenarioKind::SiteReplication,
+        ScenarioKind::BucketReplication,
+        ScenarioKind::WormObjectLock,
+        ScenarioKind::LifecycleTransition,
+        ScenarioKind::LifecycleExpiration,
+        ScenarioKind::LifecycleTagExpiration,
+        ScenarioKind::PoolExpansion,
+        ScenarioKind::PoolDecommission,
+        ScenarioKind::PoolRebalance,
+        ScenarioKind::DecommissionConsistencySafety,
+        ScenarioKind::RebalanceConsistencySafety,
+        ScenarioKind::OidcStsAuth,
+        ScenarioKind::BucketNotification,
+        ScenarioKind::AuditLogging,
+        ScenarioKind::TieringManagement,
+        ScenarioKind::TieredRemoteRestore,
+        ScenarioKind::S3Tables,
+        ScenarioKind::CapacityQuota,
+        ScenarioKind::OnDemandMigration,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -74,6 +183,25 @@ impl ScenarioKind {
             Self::DistributedLockSkew => "distributed-lock-skew",
             Self::TurmoilTcpCluster => "turmoil-tcp-cluster",
             Self::SwizzleClogChaos => "swizzle-clog-chaos",
+            Self::SiteReplication => "site-replication",
+            Self::BucketReplication => "bucket-replication",
+            Self::WormObjectLock => "worm-object-lock",
+            Self::LifecycleTransition => "lifecycle-transition",
+            Self::LifecycleExpiration => "lifecycle-expiration",
+            Self::LifecycleTagExpiration => "lifecycle-tag-expiration",
+            Self::PoolExpansion => "pool-expansion",
+            Self::PoolDecommission => "pool-decommission",
+            Self::PoolRebalance => "pool-rebalance",
+            Self::DecommissionConsistencySafety => "decommission-consistency-safety",
+            Self::RebalanceConsistencySafety => "rebalance-consistency-safety",
+            Self::OidcStsAuth => "oidc-sts-auth",
+            Self::BucketNotification => "bucket-notification",
+            Self::AuditLogging => "audit-logging",
+            Self::TieringManagement => "tiering-management",
+            Self::TieredRemoteRestore => "tiered-remote-restore",
+            Self::S3Tables => "s3-tables",
+            Self::CapacityQuota => "capacity-quota",
+            Self::OnDemandMigration => "on-demand-migration",
         }
     }
 
@@ -99,6 +227,63 @@ impl ScenarioKind {
             }
             Self::SwizzleClogChaos => {
                 "Full Swizzle-Clog chaos: asymmetric cuts, reply drops, node crashes, drive faults, and convergence"
+            }
+            Self::SiteReplication => {
+                "[#1] Multi-site active-active IAM/policy/bucket/object replication under partitions, crashes, and clock skew"
+            }
+            Self::BucketReplication => {
+                "[#2] Cross-cluster version & delete-marker replication under target outage, out-of-order packets, and loop guards"
+            }
+            Self::WormObjectLock => {
+                "[#3] WORM COMPLIANCE/GOVERNANCE/LegalHold immunity against hostile +/-1y NTP jumps and bypass attacks"
+            }
+            Self::LifecycleTransition => {
+                "[#4] Virtual-clock cold-tier transition racing with client overwrites, tier outages, and crashes"
+            }
+            Self::LifecycleExpiration => {
+                "[#5] Virtual-clock current/noncurrent/delete-marker/multipart expiration with WORM lock immunity"
+            }
+            Self::LifecycleTagExpiration => {
+                "[#6] Tag-based lifecycle AND-filters with TOCTOU generation re-check under concurrent re-tagging"
+            }
+            Self::PoolExpansion => {
+                "[#7] Live multi-pool expansion with zero-downtime reads and exact cross-pool listing union"
+            }
+            Self::PoolDecommission => {
+                "[#8] Pool decommission write-admission fence and full version drain across faults"
+            }
+            Self::PoolRebalance => {
+                "[#9] Cross-pool utilization rebalance under live S3 traffic with zero missing or duplicate keys"
+            }
+            Self::DecommissionConsistencySafety => {
+                "[#10] Decommission overwrite/delete race barriers, WORM metadata preservation, and crash durability"
+            }
+            Self::RebalanceConsistencySafety => {
+                "[#11] Rebalance source-shard bitrot RS-healing, generation fences, and destination-before-source ordering"
+            }
+            Self::OidcStsAuth => {
+                "[#12] OIDC/STS JWT validation, JWKS rotation, IdP outage caching, clock skew, and subject revocation"
+            }
+            Self::BucketNotification => {
+                "[#13] Multi-target bucket notification fan-out, filters, crash-durable spill queue, and non-blocking S3 writes"
+            }
+            Self::AuditLogging => {
+                "[#14] Hash-chained crash-durable audit trail with zero missing entries and strict credential redaction"
+            }
+            Self::TieringManagement => {
+                "[#15] Remote cold-tier registry, credential rotation, health flapping, and in-use deletion guard"
+            }
+            Self::TieredRemoteRestore => {
+                "[#16] RestoreObject bit-exactness, anti-rollback (#3074), and virtual-clock hot-cache TTL expiry"
+            }
+            Self::S3Tables => {
+                "[#17] S3 Tables catalog and Iceberg versionToken CAS serializability across crashes"
+            }
+            Self::CapacityQuota => {
+                "[#18] Distributed HARD & FIFO bucket quotas covering PUT, CopyObject, multipart aborts, and WORM locks"
+            }
+            Self::OnDemandMigration => {
+                "[#19] Lazy pull-through migration from legacy S3/MinIO with strict overwrite & tombstone shadowing"
             }
         }
     }
@@ -264,6 +449,148 @@ async fn run_scenario_async(
         ScenarioKind::SwizzleClogChaos => {
             ops =
                 scenario_swizzle_clog_chaos(&cluster, &mut oracle, &workload_rng, &mut trace).await;
+        }
+        ScenarioKind::SiteReplication => {
+            ops = run_site_replication_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::BucketReplication => {
+            ops = run_bucket_replication_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::WormObjectLock => {
+            ops = run_worm_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace).await;
+        }
+        ScenarioKind::LifecycleTransition => {
+            ops = run_lifecycle_transition_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::LifecycleExpiration => {
+            ops = run_lifecycle_expiration_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::LifecycleTagExpiration => {
+            ops = run_lifecycle_tag_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace)
+                .await;
+        }
+        ScenarioKind::PoolExpansion => {
+            ops = run_pool_expansion_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::PoolDecommission => {
+            ops = run_pool_decommission_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::PoolRebalance => {
+            ops = run_pool_rebalance_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::DecommissionConsistencySafety => {
+            ops = run_decommission_consistency_safety_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::RebalanceConsistencySafety => {
+            ops = run_rebalance_consistency_safety_scenario(
+                topology,
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::OidcStsAuth => {
+            ops =
+                run_oidc_sts_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace).await;
+        }
+        ScenarioKind::BucketNotification => {
+            ops = run_bucket_notification_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::AuditLogging => {
+            ops = run_audit_logging_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace)
+                .await;
+        }
+        ScenarioKind::TieringManagement => {
+            ops = run_tiering_management_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
+        }
+        ScenarioKind::TieredRemoteRestore => {
+            ops =
+                run_tiered_restore_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace)
+                    .await;
+        }
+        ScenarioKind::S3Tables => {
+            ops =
+                run_s3_tables_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace).await;
+        }
+        ScenarioKind::CapacityQuota => {
+            ops =
+                run_capacity_quota_scenario(seed, cluster.probes.clone(), &mut oracle, &mut trace)
+                    .await;
+        }
+        ScenarioKind::OnDemandMigration => {
+            ops = run_on_demand_migration_scenario(
+                seed,
+                cluster.probes.clone(),
+                &mut oracle,
+                &mut trace,
+            )
+            .await;
         }
         ScenarioKind::TurmoilTcpCluster => {}
     }
