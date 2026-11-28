@@ -223,6 +223,21 @@ impl ProbeRegistry {
             .cloned()
             .collect()
     }
+
+    /// Return any registered `Sometimes` or `Reachable` assertion whose
+    /// `pass_count == 0` across a multi-seed campaign (dead / unexercised branch).
+    pub fn unhit_must_hit(&self) -> Vec<ProbeStats> {
+        self.stats
+            .lock()
+            .expect("ProbeRegistry lock poisoned")
+            .values()
+            .filter(|s| {
+                matches!(s.kind, AssertionKind::Sometimes | AssertionKind::Reachable)
+                    && s.pass_count == 0
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

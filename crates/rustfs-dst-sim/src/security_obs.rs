@@ -22,8 +22,10 @@ use crate::oracle::ConsistencyOracle;
 use rustfs_dst_faults::probe::ProbeRegistry;
 use rustfs_dst_runtime::clock::{Clock, SimClock};
 use rustfs_dst_runtime::disk::{DiskIo, SimDiskIo};
-use rustfs_dst_runtime::network::{NetError, Network, RpcFrame, RpcHandler, SimNetwork};
-use rustfs_dst_runtime::rng::SimRng;
+use rustfs_dst_runtime::network::{
+    LinkFaultProfile, NetError, Network, RpcFrame, RpcHandler, SimNetwork,
+};
+use rustfs_dst_runtime::rng::{RngSource, SimRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,6 +119,18 @@ pub async fn run_oidc_sts_scenario(
     }
 
     net.register("idp", Arc::new(JwksHandler { keys: idp_ref }));
+    // Inject seed-varying network jitter & packet loss on IdP link ([S-02]).
+    let drop_prob = (rng.gen_range_usize(15) as f64) / 100.0;
+    net.set_link_profile(
+        "rustfs",
+        "idp",
+        LinkFaultProfile {
+            drop_prob,
+            min_delay_ms: 2,
+            max_delay_ms: 5 + rng.gen_range_usize(20) as u64,
+            ..Default::default()
+        },
+    );
 
     let mut jwks_cache: BTreeMap<String, String> = BTreeMap::new();
     let mut revoked_subs: BTreeSet<String> = BTreeSet::new();
@@ -124,15 +138,17 @@ pub async fn run_oidc_sts_scenario(
     let expected_aud = "rustfs-sts";
     let mut ops = 0u64;
 
-    // Fetch initial JWKS into RustFS STS cache.
+    // Fetch initial JWKS into RustFS STS cache (bounded retry over lossy link).
     async fn refresh_jwks(net: &SimNetwork, cache: &mut BTreeMap<String, String>) -> bool {
-        if let Ok(resp) = net
-            .call("rustfs", "idp", RpcFrame::new("jwks.get", Vec::new()))
-            .await
-            && let Ok(keys) = serde_json::from_slice::<BTreeMap<String, String>>(&resp.payload)
-        {
-            *cache = keys;
-            return true;
+        for _ in 0..8 {
+            if let Ok(resp) = net
+                .call("rustfs", "idp", RpcFrame::new("jwks.get", Vec::new()))
+                .await
+                && let Ok(keys) = serde_json::from_slice::<BTreeMap<String, String>>(&resp.payload)
+            {
+                *cache = keys;
+                return true;
+            }
         }
         false
     }

@@ -79,6 +79,10 @@ pub struct NodeLockService {
     clock: SimClock,
     leases: Arc<Mutex<BTreeMap<String, LeaseEntry>>>,
     next_fence: Arc<Mutex<u64>>,
+    /// Monotonic lease-recovery grace deadline set after node crash/reboot so a
+    /// rebooted node cannot vote for conflicting quorum locks before any pre-crash
+    /// lease TTL has expired (`Gray & Cheriton` crash-safe lease rule).
+    recovery_grace_until: Arc<Mutex<SimInstant>>,
 }
 
 impl NodeLockService {
@@ -87,12 +91,19 @@ impl NodeLockService {
             clock,
             leases: Arc::new(Mutex::new(BTreeMap::new())),
             next_fence: Arc::new(Mutex::new(1)),
+            recovery_grace_until: Arc::new(Mutex::new(SimInstant::ZERO)),
         }
     }
 
     pub fn try_acquire(&self, req: &LockAcquireReq) -> LockAcquireResp {
         let now_mono = self.clock.now_instant();
         let now_wall = self.clock.now_unix_ms();
+        if !req.use_wall_clock && now_mono < *self.recovery_grace_until.lock().unwrap() {
+            return LockAcquireResp {
+                granted: false,
+                fence_token: 0,
+            };
+        }
         let mut table = self.leases.lock().expect("NodeLockService lock poisoned");
         let expired = match table.get(&req.resource) {
             None => true,
@@ -141,12 +152,28 @@ impl NodeLockService {
         }
     }
 
-    /// Clear volatile in-memory leases on simulated node crash/restart.
+    /// Clear volatile in-memory leases on simulated node crash/restart while
+    /// arming a lease-recovery grace barrier covering any unexpired pre-crash
+    /// leases and bumping the fencing epoch.
     pub fn clear_on_crash(&self) {
-        self.leases
+        let mut table = self.leases.lock().expect("NodeLockService lock poisoned");
+        let max_expiry = table
+            .values()
+            .map(|e| e.expires_monotonic)
+            .max()
+            .unwrap_or(SimInstant::ZERO);
+        table.clear();
+        drop(table);
+
+        let mut grace = self
+            .recovery_grace_until
             .lock()
-            .expect("NodeLockService lock poisoned")
-            .clear();
+            .expect("grace lock poisoned");
+        if max_expiry > *grace {
+            *grace = max_expiry;
+        }
+        let mut fence = self.next_fence.lock().expect("fence counter poisoned");
+        *fence = fence.saturating_add(1_000);
     }
 }
 
@@ -222,13 +249,25 @@ impl QuorumLockClient {
         let mut granted_on = Vec::new();
         let mut max_fence = 0u64;
 
-        for peer in &self.lock_peers {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, peer) in self.lock_peers.iter().cloned().enumerate() {
+            let net = self.network.clone();
+            let caller = self.caller_node.clone();
             let frame = RpcFrame::new(METHOD_LOCK_ACQUIRE, payload.clone());
-            if let Ok(resp_frame) = self.network.call(&self.caller_node, peer, frame).await
+            join_set
+                .spawn(async move { (idx, peer.clone(), net.call(&caller, &peer, frame).await) });
+        }
+        let mut ordered = vec![None; self.lock_peers.len()];
+        while let Some(Ok((idx, peer, res))) = join_set.join_next().await {
+            ordered[idx] = Some((peer, res));
+        }
+
+        for (peer, res) in ordered.into_iter().flatten() {
+            if let Ok(resp_frame) = res
                 && let Ok(resp) = serde_json::from_slice::<LockAcquireResp>(&resp_frame.payload)
                 && resp.granted
             {
-                granted_on.push(peer.clone());
+                granted_on.push(peer);
                 max_fence = max_fence.max(resp.fence_token);
             }
         }
@@ -283,5 +322,53 @@ impl QuorumLockClient {
                 )
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_dst_runtime::rng::SimRng;
+
+    #[tokio::test]
+    async fn single_node_crash_and_reboot_cannot_cause_quorum_lock_split_brain() {
+        let clock = SimClock::new();
+        let net = SimNetwork::new(clock.clone(), SimRng::from_seed(42));
+        let peers = vec!["n1".to_string(), "n2".to_string(), "n3".to_string()];
+        let mut svcs = BTreeMap::new();
+        for p in &peers {
+            let svc = NodeLockService::new(clock.for_node(p));
+            net.register(p.clone(), Arc::new(svc.clone()));
+            svcs.insert(p.clone(), svc);
+        }
+
+        // Partition n3 so owner-1 acquires quorum lock on {n1, n2}.
+        net.isolate_node("n3");
+        let c1 = QuorumLockClient::new("n1", peers.clone(), net.clone());
+        let lease1 = c1
+            .acquire("bucket/obj", "owner-1", 10_000, false)
+            .await
+            .expect("owner-1 acquires on {n1, n2}");
+
+        // Crash & reboot n2 while healing n3, and isolate n1 so owner-2 talks to {n2, n3}.
+        svcs["n2"].clear_on_crash();
+        net.heal_all();
+        net.isolate_node("n1");
+
+        let c3 = QuorumLockClient::new("n3", peers.clone(), net.clone());
+        let split_attempt = c3.acquire("bucket/obj", "owner-2", 10_000, false).await;
+        assert!(
+            split_attempt.is_err(),
+            "rebooted n2 voted before pre-crash lease grace expired: {split_attempt:?}"
+        );
+
+        // Once monotonic time advances past the 10s pre-crash lease TTL, owner-2 acquires
+        // with a strictly higher epoch-bumped fence token.
+        clock.advance(Duration::from_secs(11));
+        let lease2 = c3
+            .acquire("bucket/obj", "owner-2", 10_000, false)
+            .await
+            .expect("acquire after grace period");
+        assert!(lease2.fence_token > lease1.fence_token);
     }
 }

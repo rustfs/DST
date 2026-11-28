@@ -351,10 +351,30 @@ impl Network for SimNetwork {
             || return_profile.partitioned
             || self.rng.gen_bool(profile.post_apply_reply_drop_prob)
         {
-            self.record(from, to, &method, "reply_dropped_after_apply");
-            return Err(NetError::ReplyDroppedAfterApply {
-                from: from.to_string(),
-                to: to.to_string(),
+            // Only classify as ReplyDroppedAfterApply when the remote handler
+            // actually succeeded (`Ok`). If the handler failed (`Err`), nothing
+            // was applied remotely so reporting ReplyDroppedAfterApply would
+            // falsely mark an unapplied write as indeterminate!
+            if response.is_ok() {
+                self.record(from, to, &method, "reply_dropped_after_apply");
+                return Err(NetError::ReplyDroppedAfterApply {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                });
+            }
+            self.record(from, to, &method, "handler_err_reply_lost");
+            if to_crashed_mid_flight {
+                return Err(NetError::NodeDown(to.to_string()));
+            }
+            if return_profile.partitioned {
+                return Err(NetError::Partitioned {
+                    from: to.to_string(),
+                    to: from.to_string(),
+                });
+            }
+            return Err(NetError::PacketDropped {
+                from: to.to_string(),
+                to: from.to_string(),
             });
         }
 
@@ -368,5 +388,35 @@ impl Network for SimNetwork {
             Err(_) => self.record(from, to, &method, "handler_err"),
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingHandler;
+
+    #[async_trait]
+    impl RpcHandler for FailingHandler {
+        async fn handle(&self, _from: &str, _req: RpcFrame) -> Result<RpcFrame, NetError> {
+            Err(NetError::Io("disk offline".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_error_with_dropped_return_link_is_never_marked_applied() {
+        let clock = SimClock::new();
+        let net = SimNetwork::new(clock, SimRng::from_seed(7));
+        net.register("n2", Arc::new(FailingHandler));
+        net.partition_one_way("n2", "n1");
+
+        let res = net
+            .call("n1", "n2", RpcFrame::new("commit", Vec::new()))
+            .await;
+        assert!(
+            !matches!(res, Err(NetError::ReplyDroppedAfterApply { .. })),
+            "unapplied handler error falsely reported as ReplyDroppedAfterApply: {res:?}"
+        );
     }
 }

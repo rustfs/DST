@@ -37,11 +37,12 @@ use std::time::Duration;
 
 const METHOD_SITE_SYNC: &str = "rustfs.site_repl.ApplyEntity";
 
-/// Causal hybrid logical timestamp for deterministic LWW conflict resolution.
+/// Hybrid Logical Clock (HLC) causal stamp so wall-clock skew on one site can
+/// never let a causally-older write overwrite a causally-newer write ([S-04]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct CausalStamp {
     logical: u64,
-    wall_ms: i64,
+    hlc_ms: i64,
     origin_site: String,
 }
 
@@ -60,6 +61,7 @@ struct SiteNode {
     disk: SimDiskIo,
     state: Arc<Mutex<BTreeMap<String, SiteEntity>>>,
     logical_counter: Arc<Mutex<u64>>,
+    max_hlc_ms: Arc<Mutex<i64>>,
     applied_events: Arc<Mutex<BTreeSet<(String, u64, String)>>>,
     loop_detected: Arc<Mutex<bool>>,
 }
@@ -74,6 +76,7 @@ impl SiteNode {
             disk,
             state: Arc::new(Mutex::new(BTreeMap::new())),
             logical_counter: Arc::new(Mutex::new(0)),
+            max_hlc_ms: Arc::new(Mutex::new(0)),
             applied_events: Arc::new(Mutex::new(BTreeSet::new())),
             loop_detected: Arc::new(Mutex::new(false)),
         }
@@ -85,13 +88,19 @@ impl SiteNode {
             *c += 1;
             *c
         };
+        let hlc_ms = {
+            let mut h = self.max_hlc_ms.lock().unwrap();
+            let now = self.clock.now_unix_ms();
+            *h = (*h).max(now) + 1;
+            *h
+        };
         let entity = SiteEntity {
             entity_key: entity_key.to_string(),
             value: value.to_string(),
             deleted,
             stamp: CausalStamp {
                 logical,
-                wall_ms: self.clock.now_unix_ms(),
+                hlc_ms,
                 origin_site: self.site_id.clone(),
             },
             hops: 0,
@@ -119,11 +128,15 @@ impl SiteNode {
             }
         }
 
-        // Advance local Lamport clock past incoming logical counter.
+        // Advance local Lamport & HLC clocks past incoming causal stamp.
         {
             let mut c = self.logical_counter.lock().unwrap();
             if entity.stamp.logical > *c {
                 *c = entity.stamp.logical;
+            }
+            let mut h = self.max_hlc_ms.lock().unwrap();
+            if entity.stamp.hlc_ms > *h {
+                *h = entity.stamp.hlc_ms;
             }
         }
 

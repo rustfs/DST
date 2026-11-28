@@ -125,6 +125,9 @@ struct SimClockInner {
     /// Optional per-node monotonic drift multiplier in parts-per-million
     /// relative to 1_000_000 (e.g., +50_000 = 5% fast, -50_000 = 5% slow).
     node_drift_ppm: HashMap<String, i64>,
+    /// Incrementally accumulated per-node monotonic nanoseconds so changing or
+    /// clearing `node_drift_ppm` never causes a monotonic clock to jump backward.
+    node_accumulated_ns: HashMap<String, u64>,
     /// Wake-up waiters indexed by deadline instant.
     waiters: BTreeMap<u64, Vec<Arc<Notify>>>,
 }
@@ -159,6 +162,7 @@ impl SimClock {
                 now_ns: 0,
                 node_skew_ms: HashMap::new(),
                 node_drift_ppm: HashMap::new(),
+                node_accumulated_ns: HashMap::new(),
                 waiters: BTreeMap::new(),
             })),
             node_id: None,
@@ -194,12 +198,19 @@ impl SimClock {
     /// (clamped to `[-500_000, +500_000]`).
     pub fn set_node_drift_ppm(&self, node_id: impl Into<String>, drift_ppm: i64) {
         let mut inner = self.inner.lock().expect("SimClock lock poisoned");
+        let id = node_id.into();
+        let cur_ns = inner.now_ns;
+        inner
+            .node_accumulated_ns
+            .entry(id.clone())
+            .or_insert(cur_ns);
         inner
             .node_drift_ppm
-            .insert(node_id.into(), drift_ppm.clamp(-500_000, 500_000));
+            .insert(id, drift_ppm.clamp(-500_000, 500_000));
     }
 
-    /// Reset all injected skews and drifts across all nodes.
+    /// Reset all injected skews and drifts across all nodes without moving any
+    /// node's accumulated monotonic instant backward.
     pub fn clear_faults(&self) {
         let mut inner = self.inner.lock().expect("SimClock lock poisoned");
         inner.node_skew_ms.clear();
@@ -212,6 +223,13 @@ impl SimClock {
         let to_wake = {
             let mut inner = self.inner.lock().expect("SimClock lock poisoned");
             inner.now_ns = inner.now_ns.saturating_add(delta_ns);
+            let drifts = inner.node_drift_ppm.clone();
+            for (id, acc_ns) in &mut inner.node_accumulated_ns {
+                let ppm = drifts.get(id).copied().unwrap_or(0);
+                let scaled = (delta_ns as i128) * (1_000_000 + i128::from(ppm)) / 1_000_000;
+                let step = u64::try_from(scaled.max(0)).unwrap_or(u64::MAX);
+                *acc_ns = acc_ns.saturating_add(step);
+            }
             let now = inner.now_ns;
             let ready_keys: Vec<u64> = inner.waiters.range(..=now).map(|(&k, _)| k).collect();
             let mut wakes = Vec::new();
@@ -242,17 +260,12 @@ impl SimClock {
     }
 
     fn effective_instant(&self, inner: &SimClockInner) -> SimInstant {
-        let base_ns = inner.now_ns;
-        let drift_ppm = self
+        let ns = self
             .node_id
             .as_ref()
-            .and_then(|id| inner.node_drift_ppm.get(id).copied())
-            .unwrap_or(0);
-        if drift_ppm == 0 {
-            return SimInstant(base_ns);
-        }
-        let scaled = (base_ns as i128) * (1_000_000 + i128::from(drift_ppm)) / 1_000_000;
-        SimInstant(u64::try_from(scaled.max(0)).unwrap_or(u64::MAX))
+            .and_then(|id| inner.node_accumulated_ns.get(id).copied())
+            .unwrap_or(inner.now_ns);
+        SimInstant(ns)
     }
 }
 
@@ -359,5 +372,22 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         let finished_ms = handle.await.unwrap();
         assert_eq!(finished_ms, 3_000);
+    }
+
+    #[test]
+    fn clearing_drift_never_moves_monotonic_clock_backward() {
+        let clock = SimClock::new();
+        let n1 = clock.for_node("n1");
+        clock.set_node_drift_ppm("n1", 100_000);
+        clock.advance(Duration::from_secs(10));
+        let before_clear = n1.now_instant();
+        assert_eq!(before_clear.as_millis(), 11_000);
+
+        clock.clear_faults();
+        let after_clear = n1.now_instant();
+        assert_eq!(after_clear, before_clear);
+
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(n1.now_instant().as_millis(), 16_000);
     }
 }

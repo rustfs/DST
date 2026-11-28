@@ -81,14 +81,34 @@ pub async fn run_s3_tables_scenario(
     );
     ops += 3;
 
-    // 2. Deleting non-empty namespace MUST fail closed!
-    let ns_has_tables = tables
-        .keys()
-        .any(|(tb, ns, _)| tb == "analytics-tb" && ns == "sales");
+    // 2. Deleting non-empty namespace MUST fail closed, while empty namespace succeeds ([S-01])!
+    fn try_delete_namespace(
+        namespaces: &mut BTreeSet<(String, String)>,
+        tables: &BTreeMap<(String, String, String), IcebergTableRecord>,
+        tb: &str,
+        ns: &str,
+    ) -> Result<(), &'static str> {
+        if tables
+            .keys()
+            .any(|(b, n, _)| b.as_str() == tb && n.as_str() == ns)
+        {
+            return Err("NamespaceNotEmpty");
+        }
+        namespaces.remove(&(tb.to_string(), ns.to_string()));
+        Ok(())
+    }
+
+    namespaces.insert(("analytics-tb".to_string(), "empty-staging".to_string()));
+    let non_empty_rejected =
+        try_delete_namespace(&mut namespaces, &tables, "analytics-tb", "sales")
+            == Err("NamespaceNotEmpty");
+    let empty_deleted_ok =
+        try_delete_namespace(&mut namespaces, &tables, "analytics-tb", "empty-staging").is_ok()
+            && !namespaces.contains(&("analytics-tb".to_string(), "empty-staging".to_string()));
     probes.always(
         "s3_tables.non_empty_namespace_delete_rejected",
-        ns_has_tables,
-        json!({}),
+        non_empty_rejected && empty_deleted_ok,
+        json!({"non_empty_rejected": non_empty_rejected, "empty_deleted_ok": empty_deleted_ok}),
     );
 
     // 3. Simulate 10 rounds of 3 concurrent Iceberg writers racing on the EXACT SAME `versionToken`!

@@ -188,21 +188,23 @@ impl MultiPoolCluster {
 
     async fn list_objects(&self, bucket: &str) -> Result<Vec<String>, StoreError> {
         let via = self.topology.node_ids()[0].clone();
-        let mut union = BTreeSet::new();
+        // Query each active/decommissioning SimCluster directly and merge by highest
+        // generation without consulting any omniscient in-memory `global_deleted`
+        // table ([S-03]), proving cross-pool tombstones and moves never leak ghosts.
+        let mut best_by_key: BTreeMap<String, u64> = BTreeMap::new();
         for p in &self.pools {
             if p.state == PoolState::Decommissioned {
                 continue;
             }
-            if let Ok(items) = p.cluster.list_objects(&via, bucket).await {
-                for item in items {
-                    let full = format!("{bucket}/{}", item.key);
-                    if !self.global_deleted.contains(&full) {
-                        union.insert(item.key);
-                    }
+            let items = p.cluster.list_objects(&via, bucket).await?;
+            for item in items {
+                let entry = best_by_key.entry(item.key).or_insert(0);
+                if item.generation > *entry {
+                    *entry = item.generation;
                 }
             }
         }
-        Ok(union.into_iter().collect())
+        Ok(best_by_key.into_keys().collect())
     }
 
     /// Move a single object from `src_pool` to `dst_pool` using a generation &
