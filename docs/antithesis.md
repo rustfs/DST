@@ -15,7 +15,7 @@ RustFS DST is intentionally layered so the same invariants and workloads work ac
 ## 3. `madsim` Drop-In Runtime (`madsim-compat`)
 
 - **Best for**: Running unmodified `tonic` / `tokio` gRPC code from `rustfs/rustfs` under a deterministic scheduler by swapping `[patch.crates-io]` to `madsim-tokio` and `madsim-tonic` with `RUSTFLAGS="--cfg madsim"`.
-- Because `madsim` replaces Tokio globally via Cargo patches, it is isolated behind the optional `madsim-compat` feature so default stable-Rust builds stay fast and dependency-minimal.
+- Because `madsim` replaces Tokio globally via Cargo patches, it stays off the default build. `is_madsim_active()` is true only when the crate is compiled with `--cfg madsim`. The empty `madsim-compat` feature does not switch the runtime on.
 
 ## 4. Antithesis Autonomous Testing
 

@@ -51,6 +51,7 @@ const METHOD_DISK_HEAL_WRITE: &str = "rustfs.disk.HealWrite";
 const METHOD_DISK_STAGE_PART: &str = "rustfs.disk.StagePart";
 const METHOD_DISK_READ_PART: &str = "rustfs.disk.ReadPart";
 const METHOD_DISK_CLEANUP_MP: &str = "rustfs.disk.CleanupMultipart";
+const METHOD_DISK_CLEANUP_PART: &str = "rustfs.disk.CleanupPart";
 const METHOD_DISK_SWEEP_TMP: &str = "rustfs.disk.SweepTmp";
 
 type ShardReadEntry = (usize, XlMeta, Option<Vec<u8>>);
@@ -178,6 +179,22 @@ struct StagePartReq {
     drive_idx: usize,
     upload_id: String,
     part_number: u32,
+    attempt_id: String,
+    part_etag: String,
+    shard_sha256: String,
+    shard_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PartOnDiskMeta {
+    part_etag: String,
+    shard_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReadPartResp {
+    part_etag: String,
+    shard_sha256: String,
     shard_bytes: Vec<u8>,
 }
 
@@ -186,12 +203,25 @@ struct ReadPartReq {
     drive_idx: usize,
     upload_id: String,
     part_number: u32,
+    attempt_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CleanupMultipartReq {
     drive_idx: usize,
     upload_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CleanupPartReq {
+    drive_idx: usize,
+    upload_id: String,
+    part_number: u32,
+    attempt_id: String,
+}
+
+fn multipart_part_path(upload_id: &str, part_number: u32, attempt_id: &str) -> String {
+    format!(".rustfs.sys/multipart/{upload_id}/part.{part_number}.{attempt_id}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -500,7 +530,14 @@ impl NodeRpcServer {
     async fn handle_stage_part(&self, req: StagePartReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
         let dir = format!(".rustfs.sys/multipart/{}", req.upload_id);
-        let path = format!("{dir}/part.{}", req.part_number);
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
+        let meta_path = format!("{path}.meta");
+        let meta = PartOnDiskMeta {
+            part_etag: req.part_etag,
+            shard_sha256: req.shard_sha256,
+        };
+        let meta_bytes =
+            Bytes::from(serde_json::to_vec(&meta).map_err(|e| NetError::Io(e.to_string()))?);
         disk.create_dir_all(&dir)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
@@ -508,6 +545,12 @@ impl NodeRpcServer {
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
         disk.fsync_file(&path)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        disk.write_file(&meta_path, meta_bytes)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        disk.fsync_file(&meta_path)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
         disk.fsync_dir(&dir)
@@ -518,15 +561,39 @@ impl NodeRpcServer {
 
     async fn handle_read_part(&self, req: ReadPartReq) -> Result<RpcFrame, NetError> {
         let disk = self.disk(req.drive_idx)?;
-        let path = format!(
-            ".rustfs.sys/multipart/{}/part.{}",
-            req.upload_id, req.part_number
-        );
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
+        let meta_path = format!("{path}.meta");
+        let meta_bytes = disk
+            .read_file(&meta_path)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        let meta: PartOnDiskMeta = serde_json::from_slice(&meta_bytes)
+            .map_err(|e| NetError::Io(format!("corrupt part meta: {e}")))?;
         let data = disk
             .read_file(&path)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
-        Ok(RpcFrame::new(METHOD_DISK_READ_PART, data))
+        if sha256_hex(&data) != meta.shard_sha256 {
+            return Err(NetError::Io("staged part checksum mismatch".to_string()));
+        }
+        let resp = ReadPartResp {
+            part_etag: meta.part_etag,
+            shard_sha256: meta.shard_sha256,
+            shard_bytes: data.to_vec(),
+        };
+        let payload = serde_json::to_vec(&resp).map_err(|e| NetError::Io(e.to_string()))?;
+        Ok(RpcFrame::new(METHOD_DISK_READ_PART, payload))
+    }
+
+    async fn handle_cleanup_part(&self, req: CleanupPartReq) -> Result<RpcFrame, NetError> {
+        let disk = self.disk(req.drive_idx)?;
+        let dir = format!(".rustfs.sys/multipart/{}", req.upload_id);
+        let path = multipart_part_path(&req.upload_id, req.part_number, &req.attempt_id);
+        let meta_path = format!("{path}.meta");
+        let _ = disk.remove_file(&path).await;
+        let _ = disk.remove_file(&meta_path).await;
+        let _ = disk.fsync_dir(&dir).await;
+        Ok(RpcFrame::new(METHOD_DISK_CLEANUP_PART, Vec::new()))
     }
 
     async fn handle_cleanup_mp(&self, req: CleanupMultipartReq) -> Result<RpcFrame, NetError> {
@@ -596,6 +663,11 @@ impl RpcHandler for NodeRpcServer {
                     .map_err(|e| NetError::Io(e.to_string()))?;
                 self.handle_cleanup_mp(req).await
             }
+            METHOD_DISK_CLEANUP_PART => {
+                let req: CleanupPartReq = serde_json::from_slice(&request.payload)
+                    .map_err(|e| NetError::Io(e.to_string()))?;
+                self.handle_cleanup_part(req).await
+            }
             METHOD_DISK_SWEEP_TMP => {
                 let req: SweepTmpReq = serde_json::from_slice(&request.payload)
                     .map_err(|e| NetError::Io(e.to_string()))?;
@@ -611,7 +683,14 @@ impl RpcHandler for NodeRpcServer {
 struct MultipartSession {
     bucket: String,
     key: String,
-    parts: BTreeMap<u32, usize>, // part_number -> orig_len
+    parts: BTreeMap<u32, MultipartPart>,
+}
+
+#[derive(Clone, Debug)]
+struct MultipartPart {
+    attempt_id: String,
+    etag: String,
+    original_len: usize,
 }
 
 /// A simulated multi-node RustFS cluster wired over deterministic runtime traits.
@@ -836,9 +915,9 @@ impl SimCluster {
         let (responded, found) = self.read_all_metas(via_node, bucket, key, false).await;
         if responded < self.topology.read_quorum {
             lock_client.release(&lease).await;
-            return Err(StoreError::WriteQuorumNotMet {
-                acked: responded,
-                required: self.topology.write_quorum,
+            return Err(StoreError::ReadQuorumNotMet {
+                healthy: responded,
+                required: self.topology.read_quorum,
             });
         }
 
@@ -1019,50 +1098,61 @@ impl SimCluster {
             by_gen.entry(entry.1.generation).or_default().push(entry);
         }
 
-        // Inspect generations from highest to lowest.
-        // If `entries.len() + unreachable < data_shards`, that generation could
-        // NEVER have achieved write quorum (W >= data_shards) and is mathematically
-        // guaranteed to be an uncommitted orphan; otherwise it may be committed and
-        // we MUST either serve it or fail closed with ReadQuorumNotMet (never stale!).
+        // Newest generation first. RustFS accepts a delete marker only at write
+        // quorum (`default_write_quorum` / early-stop), which is data+1 when
+        // data == parity. An object version is readable from any `data_shards`
+        // healthy shards, including a write that reached exactly that many and
+        // then failed the higher write quorum. A newer version that cannot have
+        // been committed and cannot be reconstructed must not hide the older one.
         for (_gen, top_entries) in by_gen.into_iter().rev() {
             let canonical = &top_entries[0].1;
-            let max_possible = top_entries.len() + unreachable;
-            if max_possible < self.topology.data_shards {
-                self.probes.reachable(
-                    "ecstore.skipped_provably_uncommitted_orphan",
-                    json!({"bucket": bucket, "key": key, "orphan_gen": canonical.generation}),
-                );
-                continue;
-            }
+            let votes = top_entries.len();
+            let max_possible = votes + unreachable;
 
             if canonical.is_delete_marker {
-                if top_entries.len() >= self.topology.read_quorum {
+                if votes >= self.topology.write_quorum {
                     return Err(StoreError::NotFound(format!("{bucket}/{key}")));
                 }
+                if max_possible < self.topology.write_quorum {
+                    self.probes.reachable(
+                        "ecstore.skipped_provably_uncommitted_orphan",
+                        json!({"bucket": bucket, "key": key, "orphan_gen": canonical.generation}),
+                    );
+                    continue;
+                }
                 return Err(StoreError::ReadQuorumNotMet {
-                    healthy: top_entries.len(),
-                    required: self.topology.read_quorum,
+                    healthy: votes,
+                    required: self.topology.write_quorum,
                 });
             }
 
             // Verify per-shard SHA-256 checksums to filter out silent bitrot!
             let mut healthy_shards = Vec::new();
             let mut bitrot_detected = false;
-            for (global_idx, meta, maybe_bytes) in &top_entries {
+            for (_global_idx, meta, maybe_bytes) in &top_entries {
                 if let Some(bytes) = maybe_bytes {
                     if sha256_hex(bytes) == meta.shard_sha256 {
-                        healthy_shards.push((*global_idx, bytes.clone()));
+                        healthy_shards.push((meta.shard_index, bytes.clone()));
                     } else {
                         bitrot_detected = true;
                         self.probes.reachable(
                             "ecstore.bitrot_detected_on_read",
-                            json!({"bucket": bucket, "key": key, "shard": global_idx}),
+                            json!({"bucket": bucket, "key": key, "shard": meta.shard_index}),
                         );
                     }
                 }
             }
+            healthy_shards.sort_by_key(|(idx, _)| *idx);
+            healthy_shards.dedup_by_key(|(idx, _)| *idx);
 
             if healthy_shards.len() < self.topology.data_shards {
+                if max_possible < self.topology.write_quorum {
+                    self.probes.reachable(
+                        "ecstore.skipped_provably_uncommitted_orphan",
+                        json!({"bucket": bucket, "key": key, "orphan_gen": canonical.generation}),
+                    );
+                    continue;
+                }
                 return Err(StoreError::ReadQuorumNotMet {
                     healthy: healthy_shards.len(),
                     required: self.topology.data_shards,
@@ -1145,16 +1235,54 @@ impl SimCluster {
             });
         }
 
+        let unreachable = self.topology.total_drives.saturating_sub(responded);
         let mut out = Vec::new();
         for (key, metas) in by_key {
-            let max_gen = metas.iter().map(|m| m.generation).max().unwrap_or(0);
-            let top: Vec<&XlMeta> = metas.iter().filter(|m| m.generation == max_gen).collect();
-            if top.len() >= self.topology.read_quorum && !top[0].is_delete_marker {
+            let mut gens: Vec<u64> = metas.iter().map(|meta| meta.generation).collect();
+            gens.sort_unstable();
+            gens.dedup();
+            let mut choice: Option<&XlMeta> = None;
+            let mut ambiguous = false;
+            for generation in gens.into_iter().rev() {
+                let top: Vec<&XlMeta> = metas
+                    .iter()
+                    .filter(|meta| meta.generation == generation)
+                    .collect();
+                let votes = top.len();
+                let max_possible = votes + unreachable;
+                if top[0].is_delete_marker {
+                    if votes >= self.topology.write_quorum {
+                        choice = None;
+                        break;
+                    }
+                    if max_possible < self.topology.write_quorum {
+                        continue;
+                    }
+                    ambiguous = true;
+                    break;
+                }
+                if votes >= self.topology.read_quorum {
+                    choice = Some(top[0]);
+                    break;
+                }
+                if max_possible < self.topology.read_quorum {
+                    continue;
+                }
+                ambiguous = true;
+                break;
+            }
+            if ambiguous {
+                return Err(StoreError::ReadQuorumNotMet {
+                    healthy: responded,
+                    required: self.topology.read_quorum,
+                });
+            }
+            if let Some(meta) = choice {
                 out.push(ListedObject {
                     key,
-                    generation: top[0].generation,
-                    version_id: top[0].version_id.clone(),
-                    payload_sha256: top[0].payload_sha256.clone(),
+                    generation: meta.generation,
+                    version_id: meta.version_id.clone(),
+                    payload_sha256: meta.payload_sha256.clone(),
                 });
             }
         }
@@ -1188,14 +1316,23 @@ impl SimCluster {
         }
         let shards = encode(data, self.topology.data_shards, self.topology.parity_shards)
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let part = MultipartPart {
+            attempt_id: self.rng.gen_uuid_v4().to_string(),
+            etag: sha256_hex(data),
+            original_len: data.len(),
+        };
 
         let mut acked = 0usize;
         for (node_id, drive_idx, global_idx) in self.drive_slots() {
+            let shard = &shards[global_idx];
             let req = StagePartReq {
                 drive_idx,
                 upload_id: upload_id.to_string(),
                 part_number,
-                shard_bytes: shards[global_idx].bytes.clone(),
+                attempt_id: part.attempt_id.clone(),
+                part_etag: part.etag.clone(),
+                shard_sha256: shard.sha256_hex.clone(),
+                shard_bytes: shard.bytes.clone(),
             };
             let payload = serde_json::to_vec(&req).expect("serialize StagePartReq");
             if self
@@ -1213,15 +1350,51 @@ impl SimCluster {
         }
 
         if acked < self.topology.write_quorum {
+            self.cleanup_multipart_part(via_node, upload_id, part_number, &part.attempt_id)
+                .await;
             return Err(StoreError::WriteQuorumNotMet {
                 acked,
                 required: self.topology.write_quorum,
             });
         }
-        if let Some(sess) = self.multipart_sessions.get_mut(upload_id) {
-            sess.parts.insert(part_number, data.len());
+
+        let previous = self
+            .multipart_sessions
+            .get_mut(upload_id)
+            .expect("upload session cannot change during staging")
+            .parts
+            .insert(part_number, part);
+        if let Some(previous) = previous {
+            self.cleanup_multipart_part(via_node, upload_id, part_number, &previous.attempt_id)
+                .await;
         }
         Ok(())
+    }
+
+    async fn cleanup_multipart_part(
+        &self,
+        via_node: &str,
+        upload_id: &str,
+        part_number: u32,
+        attempt_id: &str,
+    ) {
+        for (node_id, drive_idx, _) in self.drive_slots() {
+            let req = CleanupPartReq {
+                drive_idx,
+                upload_id: upload_id.to_string(),
+                part_number,
+                attempt_id: attempt_id.to_string(),
+            };
+            let payload = serde_json::to_vec(&req).expect("serialize CleanupPartReq");
+            let _ = self
+                .network
+                .call(
+                    via_node,
+                    &node_id,
+                    RpcFrame::new(METHOD_DISK_CLEANUP_PART, payload),
+                )
+                .await;
+        }
     }
 
     /// Atomically assemble staged multipart parts and commit the final object.
@@ -1237,16 +1410,17 @@ impl SimCluster {
             .ok_or_else(|| StoreError::UploadNotFound(upload_id.to_string()))?;
 
         let mut assembled = Vec::new();
-        for (&part_number, &orig_len) in &sess.parts {
+        for (&part_number, part) in &sess.parts {
             let mut shards = Vec::new();
             for (node_id, drive_idx, global_idx) in self.drive_slots() {
                 let req = ReadPartReq {
                     drive_idx,
                     upload_id: upload_id.to_string(),
                     part_number,
+                    attempt_id: part.attempt_id.clone(),
                 };
                 let payload = serde_json::to_vec(&req).expect("serialize ReadPartReq");
-                if let Ok(frame) = self
+                let Ok(frame) = self
                     .network
                     .call(
                         via_node,
@@ -1254,8 +1428,15 @@ impl SimCluster {
                         RpcFrame::new(METHOD_DISK_READ_PART, payload),
                     )
                     .await
+                else {
+                    continue;
+                };
+                let Ok(resp) = serde_json::from_slice::<ReadPartResp>(&frame.payload) else {
+                    continue;
+                };
+                if resp.part_etag == part.etag && sha256_hex(&resp.shard_bytes) == resp.shard_sha256
                 {
-                    shards.push((global_idx, frame.payload.to_vec()));
+                    shards.push((global_idx, resp.shard_bytes));
                 }
             }
             if shards.len() < self.topology.data_shards {
@@ -1268,9 +1449,14 @@ impl SimCluster {
                 &shards,
                 self.topology.data_shards,
                 self.topology.parity_shards,
-                orig_len,
+                part.original_len,
             )
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if sha256_hex(&part_bytes) != part.etag {
+                return Err(StoreError::Internal(format!(
+                    "reconstructed payload digest mismatch for part {part_number}"
+                )));
+            }
             assembled.extend_from_slice(&part_bytes);
         }
 
@@ -1354,7 +1540,9 @@ impl SimCluster {
                 }
             }
             let min_needed = if canonical.is_delete_marker {
-                self.topology.read_quorum
+                // Same threshold as GET early-stop: a sub-write-quorum delete
+                // marker must not be healed into a durable deletion.
+                self.topology.write_quorum
             } else {
                 self.topology.data_shards
             };
@@ -1522,5 +1710,198 @@ impl SimCluster {
             }
         }
         errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::TopologyKind;
+    use rustfs_dst_runtime::disk::DiskIo;
+
+    async fn plant_meta(cluster: &SimCluster, drives: usize, meta: &XlMeta) {
+        let bytes = Bytes::from(serde_json::to_vec(meta).expect("meta"));
+        let path = format!("{}/{}/xl.meta", meta.bucket, meta.key);
+        for (node_id, drive_idx, _) in cluster.drive_slots().into_iter().take(drives) {
+            cluster.nodes[&node_id].disks[drive_idx]
+                .write_file(&path, bytes.clone())
+                .await
+                .expect("plant xl.meta");
+        }
+    }
+
+    fn delete_meta(generation: u64) -> XlMeta {
+        XlMeta {
+            bucket: "bkt".to_string(),
+            key: "obj".to_string(),
+            version_id: format!("del-{generation}"),
+            generation,
+            is_delete_marker: true,
+            orig_len: 0,
+            payload_sha256: String::new(),
+            shard_index: 0,
+            shard_sha256: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_write_quorum_delete_marker_does_not_hide_the_object() {
+        let cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 11);
+        let payload = b"ledger-v1-visible";
+        let put = cluster
+            .put_object("n1", "bkt", "obj", payload, PutConditions::default())
+            .await
+            .expect("put");
+        // 3x2 write quorum is 4. Three delete markers used to satisfy read
+        // quorum (3) and were reported as NotFound.
+        plant_meta(&cluster, 3, &delete_meta(put.generation + 1)).await;
+
+        let got = cluster
+            .get_object("n2", "bkt", "obj")
+            .await
+            .expect("older object remains readable");
+        assert_eq!(got.payload, payload);
+        assert_eq!(got.generation, put.generation);
+
+        let listed = cluster.list_objects("n1", "bkt").await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "obj");
+
+        plant_meta(
+            &cluster,
+            cluster.topology.total_drives,
+            &delete_meta(put.generation + 2),
+        )
+        .await;
+        assert!(matches!(
+            cluster.get_object("n1", "bkt", "obj").await,
+            Err(StoreError::NotFound(_))
+        ));
+        let listed = cluster
+            .list_objects("n1", "bkt")
+            .await
+            .expect("list after quorum delete");
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_uncommitted_version_falls_back_to_older_object() {
+        let cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 12);
+        let payload = b"committed-v1";
+        let put = cluster
+            .put_object("n1", "bkt", "obj", payload, PutConditions::default())
+            .await
+            .expect("put");
+        let mut bogus = delete_meta(put.generation + 1);
+        bogus.is_delete_marker = false;
+        bogus.orig_len = 4;
+        bogus.payload_sha256 = "not-a-real-payload".to_string();
+        bogus.shard_sha256 = "00".to_string();
+        // Metadata without a matching shard cannot be reconstructed, and three
+        // copies are below write quorum, so GET must return v1 instead of failing closed.
+        plant_meta(&cluster, 3, &bogus).await;
+        let got = cluster
+            .get_object("n3", "bkt", "obj")
+            .await
+            .expect("fallback");
+        assert_eq!(got.payload, payload);
+        assert_eq!(got.generation, put.generation);
+    }
+
+    #[tokio::test]
+    async fn heal_does_not_promote_a_sub_write_quorum_delete() {
+        let cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 13);
+        let payload = b"keep-me";
+        let put = cluster
+            .put_object("n1", "bkt", "obj", payload, PutConditions::default())
+            .await
+            .expect("put");
+        plant_meta(&cluster, 3, &delete_meta(put.generation + 1)).await;
+        cluster.heal_object("n1", "bkt", "obj").await.expect("heal");
+        let got = cluster
+            .get_object("n2", "bkt", "obj")
+            .await
+            .expect("still live");
+        assert_eq!(got.payload, payload);
+        let errors = cluster
+            .verify_cluster_convergence("bkt", &["obj".to_string()])
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_upload_part_removes_only_that_attempt() {
+        let mut cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 14);
+        for (node_id, drive_idx, _) in cluster.drive_slots().into_iter().skip(3) {
+            cluster.set_drive_offline(&node_id, drive_idx, true);
+        }
+        let upload_id = cluster.create_multipart("bkt", "obj");
+        let err = cluster
+            .upload_part("n1", &upload_id, 1, b"partial-part-bytes")
+            .await;
+        assert!(matches!(err, Err(StoreError::WriteQuorumNotMet { .. })));
+        for env in cluster.nodes.values() {
+            for disk in &env.disks {
+                let leaked: Vec<String> = disk
+                    .all_files()
+                    .into_iter()
+                    .filter(|path| path.contains("multipart"))
+                    .collect();
+                assert!(leaked.is_empty(), "{leaked:?}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn failed_replacement_preserves_the_acknowledged_part() {
+        let original = b"acknowledged-part";
+        for replacement in [original.as_slice(), b"different-payload"] {
+            let mut cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 15);
+            let upload_id = cluster.create_multipart("bkt", "obj");
+            // The acknowledged part initially exists on exactly the write quorum.
+            for (node, drive, _) in cluster.drive_slots().into_iter().skip(4) {
+                cluster.set_drive_offline(&node, drive, true);
+            }
+            cluster
+                .upload_part("n1", &upload_id, 1, original)
+                .await
+                .expect("initial part");
+
+            for (node, drive, _) in cluster.drive_slots().into_iter().skip(3) {
+                cluster.set_drive_offline(&node, drive, true);
+            }
+            assert!(matches!(
+                cluster.upload_part("n1", &upload_id, 1, replacement).await,
+                Err(StoreError::WriteQuorumNotMet { .. })
+            ));
+            cluster.heal_infrastructure();
+
+            cluster
+                .complete_multipart("n1", &upload_id)
+                .await
+                .expect("previously acknowledged part must still complete");
+            let got = cluster.get_object("n2", "bkt", "obj").await.expect("get");
+            assert_eq!(got.payload, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_replacement_is_selected_by_completion() {
+        let mut cluster = SimCluster::new(TopologyKind::ThreeByTwo.spec(), 16);
+        let upload_id = cluster.create_multipart("bkt", "obj");
+        cluster
+            .upload_part("n1", &upload_id, 1, b"old-part")
+            .await
+            .expect("initial part");
+        cluster
+            .upload_part("n1", &upload_id, 1, b"new-part-with-different-length")
+            .await
+            .expect("replace part");
+
+        cluster
+            .complete_multipart("n1", &upload_id)
+            .await
+            .expect("complete replacement");
+        let got = cluster.get_object("n2", "bkt", "obj").await.expect("get");
+        assert_eq!(got.payload, b"new-part-with-different-length");
     }
 }

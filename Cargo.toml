@@ -53,6 +53,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

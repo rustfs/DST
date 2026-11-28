@@ -9,6 +9,9 @@ on:
         description: "Seeds per scenario per topology"
         required: false
         default: "500"
+      start_seed:
+        description: "Starting seed (defaults to a new window for each run)"
+        required: false
 
 permissions:
   contents: read
@@ -29,9 +32,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run multi-seed DST campaign
+        env:
+          DST_SEEDS: ${{ inputs.seeds || '500' }}
+          DST_START_SEED: ${{ inputs.start_seed }}
+          DST_TOPOLOGY: ${{ matrix.topology }}
         run: |
-          SEEDS="${{ github.event.inputs.seeds || '500' }}"
+          mkdir -p dst-artifacts
+          start_seed="${DST_START_SEED:-$(((GITHUB_RUN_NUMBER - 1) * 500 + 1))}"
           cargo run --release -p rustfs-dst-cli -- run \
             --scenario all \
-            --topology "${{ matrix.topology }}" \
-            --seeds "$SEEDS"
+            --topology "$DST_TOPOLOGY" \
+            --start-seed "$start_seed" \
+            --seeds "$DST_SEEDS" \
+            --json > "dst-artifacts/$DST_TOPOLOGY.json"
+
+      - name: Upload campaign report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-campaign-${{ matrix.topology }}
+          path: dst-artifacts/*.json

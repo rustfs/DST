@@ -27,12 +27,25 @@
 //!    replacement for `tokio`, `tonic`, and `rand` when testing unmodified
 //!    gRPC/Tonic servers in `rustfs/rustfs`.
 
-/// Returns `true` when compiled under `madsim` (`RUSTFLAGS="--cfg madsim"`).
+/// Returns `true` when this crate is compiled with `RUSTFLAGS="--cfg madsim"`.
+///
+/// The `madsim-compat` feature only marks the hook. It does not activate
+/// madsim; Cargo patches and `--cfg madsim` do.
 pub const fn is_madsim_active() -> bool {
-    cfg!(feature = "madsim-compat")
+    cfg!(madsim)
 }
 
 /// Yield execution cleanly across standard Tokio, Turmoil, and Madsim runtimes.
 pub async fn yield_now() {
     tokio::task::yield_now().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_build_does_not_report_madsim_active() {
+        assert!(!is_madsim_active());
+    }
 }
