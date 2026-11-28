@@ -506,6 +506,11 @@ impl SimDiskIo {
         inner.faults.offline = offline;
     }
 
+    pub fn set_capacity_bytes(&self, capacity_bytes: Option<u64>) {
+        let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
+        inner.faults.capacity_bytes = capacity_bytes;
+    }
+
     pub fn is_offline(&self) -> bool {
         self.inner
             .lock()

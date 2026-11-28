@@ -20,11 +20,12 @@ use rustfs_dst_sim::scenarios::{ScenarioKind, run_scenario};
 use rustfs_dst_sim::topology::TopologyKind;
 
 #[test]
-fn all_33_scenarios_pass_across_4x4_3x2_and_4x2() {
-    assert_eq!(ScenarioKind::ALL.len(), 33);
+fn all_35_scenarios_pass_across_4x4_3x2_and_4x2() {
+    assert_eq!(ScenarioKind::ALL.len(), 35);
     assert_eq!(ScenarioKind::CORE.len(), 7);
     assert_eq!(ScenarioKind::ENTERPRISE.len(), 19);
     assert_eq!(ScenarioKind::SCANNER.len(), 7);
+    assert_eq!(ScenarioKind::COMPOSITE.len(), 2);
 
     for topo in [
         TopologyKind::FourByFour,
@@ -84,6 +85,14 @@ fn multi_seed_swizzle_clog_enterprise_and_scanner_chaos_hold_all_invariants() {
                 assert!(
                     rep.passed,
                     "scanner scenario {scenario} failed on {topo} seed={seed}: {:?}",
+                    rep.violations
+                );
+            }
+            for scenario in ScenarioKind::COMPOSITE {
+                let rep = run_scenario(scenario, topo, seed);
+                assert!(
+                    rep.passed,
+                    "composite scenario {scenario} failed on {topo} seed={seed}: {:?}",
                     rep.violations
                 );
             }

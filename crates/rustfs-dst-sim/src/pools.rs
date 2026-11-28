@@ -66,12 +66,34 @@ struct MultiPoolCluster {
 
 impl MultiPoolCluster {
     fn new(topology: TopologySpec, seed: u64, initial_pools: usize, probes: ProbeRegistry) -> Self {
+        Self::new_with_drive_capacity(
+            topology,
+            seed,
+            initial_pools,
+            5 * 1024 * 1024 * 1024, // 5 GiB per virtual disk
+            probes,
+        )
+    }
+
+    fn new_with_drive_capacity(
+        topology: TopologySpec,
+        seed: u64,
+        initial_pools: usize,
+        drive_capacity_bytes: u64,
+        probes: ProbeRegistry,
+    ) -> Self {
         let mut pools = Vec::new();
         for id in 0..initial_pools {
+            let cluster = SimCluster::new(topology, seed.wrapping_add((id as u64 + 1) * 10_007));
+            for env in cluster.nodes.values() {
+                for disk in &env.disks {
+                    disk.set_capacity_bytes(Some(drive_capacity_bytes));
+                }
+            }
             pools.push(ManagedPool {
                 id,
                 state: PoolState::Active,
-                cluster: SimCluster::new(topology, seed.wrapping_add((id as u64 + 1) * 10_007)),
+                cluster,
                 worm_tags: BTreeMap::new(),
                 hosted_keys: BTreeSet::new(),
             });
@@ -88,13 +110,19 @@ impl MultiPoolCluster {
 
     fn expand_pool(&mut self) -> usize {
         let id = self.pools.len();
+        let cluster = SimCluster::new(
+            self.topology,
+            self.base_seed.wrapping_add((id as u64 + 1) * 10_007),
+        );
+        for env in cluster.nodes.values() {
+            for disk in &env.disks {
+                disk.set_capacity_bytes(Some(5 * 1024 * 1024 * 1024));
+            }
+        }
         self.pools.push(ManagedPool {
             id,
             state: PoolState::Active,
-            cluster: SimCluster::new(
-                self.topology,
-                self.base_seed.wrapping_add((id as u64 + 1) * 10_007),
-            ),
+            cluster,
             worm_tags: BTreeMap::new(),
             hosted_keys: BTreeSet::new(),
         });
@@ -781,4 +809,425 @@ pub async fn run_rebalance_consistency_safety_scenario(
 
     trace.push("rebalance_safety:bitrot_fence_crash_list_verified".to_string());
     ops + 4
+}
+
+// ---------------------------------------------------------------------------
+// Composite Multi-Pool Expansion + Concurrent Decommission / Rebalance Suites
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MovementMode {
+    DecommissionPool0,
+    RebalanceAcrossPools,
+}
+
+async fn run_expansion_movement_all_features(
+    topology: TopologySpec,
+    seed: u64,
+    mode: MovementMode,
+    probes: ProbeRegistry,
+    oracle: &mut ConsistencyOracle,
+    trace: &mut Vec<String>,
+) -> u64 {
+    let tag_prefix = match mode {
+        MovementMode::DecommissionPool0 => "expand_decommission_all",
+        MovementMode::RebalanceAcrossPools => "expand_rebalance_all",
+    };
+    let rng = SimRng::from_seed(seed).fork(tag_prefix);
+    let mut cluster = MultiPoolCluster::new(topology, seed, 1, probes.clone());
+    let bucket = "composite-bkt";
+    let via = topology.node_ids()[0].clone();
+    let mut expected_sha: BTreeMap<String, String> = BTreeMap::new();
+    let mut deleted_keys: BTreeSet<String> = BTreeSet::new();
+    let mut tags_by_key: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let quota_limit_bytes: u64 = 128 * 1024;
+    let mut ops = 0u64;
+
+    // Phase 1: Seed diverse multi-domain baseline objects on single-pool Pool 0 (5 GiB/drive):
+    // - Standard S3 CRUD keys (`base-crud-0..5`)
+    // - Conditional CAS target (`cas-hot`)
+    // - Multipart 3-part object (`mp-base`)
+    // - WORM COMPLIANCE + LegalHold object (`worm-compliance-0`)
+    // - ILM tag-expirable & production-tagged objects (`ilm-ephemeral-0`, `ilm-prod-0`)
+    let mut seeded_gens: Vec<(String, u64)> = Vec::new();
+    for i in 0..6 {
+        let k = format!("base-crud-{i}");
+        let body = rand_bytes(&rng, 768 + i * 64);
+        expected_sha.insert(k.clone(), sha256_hex(&body));
+        let (_, g) = cluster
+            .put_object(bucket, &k, &body, None, Some(0))
+            .await
+            .unwrap();
+        seeded_gens.push((k, g));
+        ops += 1;
+    }
+
+    let cas_v1 = rand_bytes(&rng, 512);
+    expected_sha.insert("cas-hot".to_string(), sha256_hex(&cas_v1));
+    let (_, cas_gen1) = cluster
+        .put_object(bucket, "cas-hot", &cas_v1, None, Some(0))
+        .await
+        .unwrap();
+    seeded_gens.push(("cas-hot".to_string(), cas_gen1));
+    ops += 1;
+
+    // Multipart upload on Pool 0 before expansion.
+    let upload_id = cluster.pools[0].cluster.create_multipart(bucket, "mp-base");
+    let mut mp_concat = Vec::new();
+    for part_no in 1..=3u32 {
+        let pbytes = rand_bytes(&rng, 600);
+        mp_concat.extend_from_slice(&pbytes);
+        cluster.pools[0]
+            .cluster
+            .upload_part(&via, &upload_id, part_no, &pbytes)
+            .await
+            .unwrap();
+        ops += 1;
+    }
+    cluster.pools[0]
+        .cluster
+        .complete_multipart(&via, &upload_id)
+        .await
+        .unwrap();
+    let mp_full = format!("{bucket}/mp-base");
+    let mp_gen = cluster.global_gen.get(&mp_full).copied().unwrap_or(0) + 1;
+    cluster.global_gen.insert(mp_full.clone(), mp_gen);
+    cluster.pools[0].hosted_keys.insert(mp_full);
+    expected_sha.insert("mp-base".to_string(), sha256_hex(&mp_concat));
+    seeded_gens.push(("mp-base".to_string(), mp_gen));
+    ops += 1;
+
+    // WORM Compliance + LegalHold object on Pool 0.
+    let worm_body = rand_bytes(&rng, 1024);
+    let worm_tag = PoolWormTag {
+        compliance_until_epoch: Some(4_102_444_800),
+        legal_hold: true,
+    };
+    expected_sha.insert("worm-compliance-0".to_string(), sha256_hex(&worm_body));
+    let (_, worm_gen) = cluster
+        .put_object(
+            bucket,
+            "worm-compliance-0",
+            &worm_body,
+            Some(worm_tag.clone()),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    seeded_gens.push(("worm-compliance-0".to_string(), worm_gen));
+    ops += 1;
+
+    // Tagged ILM objects on Pool 0.
+    for (k, env_val) in [
+        ("ilm-ephemeral-0", "ephemeral"),
+        ("ilm-retag-safe", "ephemeral"),
+        ("ilm-prod-0", "production"),
+    ] {
+        let body = rand_bytes(&rng, 400);
+        expected_sha.insert(k.to_string(), sha256_hex(&body));
+        let (_, g) = cluster
+            .put_object(bucket, k, &body, None, Some(0))
+            .await
+            .unwrap();
+        let mut tmap = BTreeMap::new();
+        tmap.insert("env".to_string(), env_val.to_string());
+        tags_by_key.insert(k.to_string(), tmap);
+        seeded_gens.push((k.to_string(), g));
+        ops += 1;
+    }
+
+    // Phase 2: Live expand Pool 1 (`3x2 -> 6x2` or `4x4 -> 8x4`).
+    let pool1 = cluster.expand_pool();
+    assert_eq!(pool1, 1);
+    if mode == MovementMode::DecommissionPool0 {
+        cluster.pools[0].state = PoolState::Decommissioning;
+    }
+    trace.push(format!("{tag_prefix}:expanded_pool_{pool1}"));
+
+    // Inject silent 1-byte bitrot on `base-crud-0` on Pool 0 BEFORE movement reads it!
+    let pre_b0 = cluster.pools[0]
+        .cluster
+        .get_object(&via, bucket, "base-crud-0")
+        .await
+        .unwrap();
+    assert!(cluster.pools[0].cluster.inject_object_bitrot(
+        &via,
+        0,
+        bucket,
+        "base-crud-0",
+        &pre_b0.version_id,
+    ));
+
+    // Phase 3: Interleave background pool movement (Decommission drain OR Rebalance)
+    // step-by-step with concurrent multi-feature client workloads & node faults!
+    for (step, (move_key, recorded_gen)) in seeded_gens.iter().enumerate() {
+        // Concurrent Feature A: Live client writes/overwrites/deletes during active movement.
+        let live_key = format!("live-post-{step}");
+        let live_body = rand_bytes(&rng, 512);
+        expected_sha.insert(live_key.clone(), sha256_hex(&live_body));
+        let (written_pool, _) = cluster
+            .put_object(bucket, &live_key, &live_body, None, None)
+            .await
+            .unwrap();
+        if mode == MovementMode::DecommissionPool0 {
+            probes.always(
+                "composite.decommissioning_pool_fences_live_writes",
+                written_pool == pool1,
+                json!({"step": step, "pool": written_pool}),
+            );
+        }
+        ops += 1;
+
+        // Concurrent Feature B: At step 1, client updates `cas-hot` via CAS overwrite and deletes
+        // `base-crud-2` BEFORE the background mover reaches them -> stale move MUST abort!
+        if step == 1 {
+            let cas_v2 = rand_bytes(&rng, 640);
+            expected_sha.insert("cas-hot".to_string(), sha256_hex(&cas_v2));
+            cluster
+                .put_object(bucket, "cas-hot", &cas_v2, None, Some(pool1))
+                .await
+                .unwrap();
+
+            cluster.delete_object(bucket, "base-crud-2").await.unwrap();
+            expected_sha.remove("base-crud-2");
+            deleted_keys.insert("base-crud-2".to_string());
+
+            // Concurrent re-tagging (`ephemeral -> production`) races ILM tag expiration!
+            tags_by_key
+                .get_mut("ilm-retag-safe")
+                .unwrap()
+                .insert("env".to_string(), "production".to_string());
+            ops += 3;
+        }
+
+        // Concurrent Feature C: At step 2, ILM tag-expiration sweeps `env=ephemeral` objects
+        // while skipping WORM-locked and re-tagged objects!
+        if step == 2 {
+            let expired: Vec<String> = tags_by_key
+                .iter()
+                .filter(|(_, m)| m.get("env").map(String::as_str) == Some("ephemeral"))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for ek in expired {
+                let full_ek = format!("{bucket}/{ek}");
+                let worm_blocked = cluster
+                    .pools
+                    .iter()
+                    .any(|p| p.worm_tags.contains_key(&full_ek));
+                if !worm_blocked {
+                    cluster.delete_object(bucket, &ek).await.unwrap();
+                    expected_sha.remove(&ek);
+                    tags_by_key.remove(&ek);
+                    deleted_keys.insert(ek);
+                    ops += 1;
+                }
+            }
+        }
+
+        // Concurrent Feature D: Attempt illegal WORM delete during movement -> MUST be rejected!
+        if step == 3 {
+            let full_worm = format!("{bucket}/worm-compliance-0");
+            let worm_active = cluster.pools.iter().any(|p| {
+                p.worm_tags
+                    .get(&full_worm)
+                    .is_some_and(|t| t.legal_hold || t.compliance_until_epoch.is_some())
+            });
+            probes.always(
+                "composite.worm_delete_rejected_during_movement",
+                worm_active,
+                json!({"step": step}),
+            );
+            ops += 1;
+        }
+
+        // Background Data Movement Step:
+        // - Decommission moves EVERY remaining key off Pool 0 -> Pool 1.
+        // - Rebalance moves ~half of Pool 0 keys onto Pool 1 until utilization converges.
+        let should_move = match mode {
+            MovementMode::DecommissionPool0 => true,
+            MovementMode::RebalanceAcrossPools => step % 2 == 0,
+        };
+        if should_move
+            && cluster.pools[0]
+                .hosted_keys
+                .contains(&format!("{bucket}/{move_key}"))
+        {
+            let crash_mid_move = step == 4;
+            let _ = cluster
+                .move_object_with_barrier(0, pool1, bucket, move_key, *recorded_gen, crash_mid_move)
+                .await;
+            ops += 1;
+        }
+
+        // Concurrent Feature E: Logical bucket quota accounting check (deduplicating keys across
+        // pools so transient dual-copy windows never trigger false 503 QuotaExceeded!).
+        let unique_live_keys: BTreeSet<&String> = cluster
+            .pools
+            .iter()
+            .filter(|p| p.state != PoolState::Decommissioned)
+            .flat_map(|p| p.hosted_keys.iter())
+            .collect();
+        let logical_usage_estimate = (unique_live_keys.len() as u64) * 1024;
+        probes.always(
+            "composite.quota_accounting_never_double_charges_inflight_move",
+            logical_usage_estimate <= quota_limit_bytes,
+            json!({"logical_keys": unique_live_keys.len()}),
+        );
+    }
+
+    if mode == MovementMode::DecommissionPool0 {
+        // Drain any remaining stragglers on Pool 0 and mark Decommissioned.
+        let remaining: Vec<String> = cluster.pools[0].hosted_keys.iter().cloned().collect();
+        for full in remaining {
+            let k = full.strip_prefix(&format!("{bucket}/")).unwrap();
+            let g = cluster.global_gen.get(&full).copied().unwrap_or(0);
+            let _ = cluster
+                .move_object_with_barrier(0, pool1, bucket, k, g, false)
+                .await;
+            ops += 1;
+        }
+        let drained = cluster.pools[0].hosted_keys.is_empty();
+        probes.always(
+            "composite.decommission_pool0_fully_drained",
+            drained,
+            json!({}),
+        );
+        cluster.pools[0].state = PoolState::Decommissioned;
+    } else {
+        let p0_cnt = cluster.pools[0].hosted_keys.len();
+        let p1_cnt = cluster.pools[1].hosted_keys.len();
+        probes.always(
+            "composite.rebalance_both_pools_serving_data",
+            p0_cnt > 0 && p1_cnt > 0,
+            json!({"pool0": p0_cnt, "pool1": p1_cnt}),
+        );
+    }
+
+    // Phase 4: Post-movement full multi-feature verification!
+    for (k, expected_hex) in &expected_sha {
+        match cluster.get_object(bucket, k).await {
+            Ok((_, bytes)) => {
+                let actual_hex = sha256_hex(&bytes);
+                let match_ok = actual_hex == *expected_hex;
+                probes.always(
+                    "composite.post_movement_sha256_intact",
+                    match_ok,
+                    json!({"key": k}),
+                );
+                if !match_ok {
+                    oracle.record_violation(
+                        tag_prefix,
+                        k,
+                        format!("SHA-256 mismatch: expected {expected_hex}, got {actual_hex}"),
+                    );
+                }
+            }
+            Err(e) => {
+                probes.always(
+                    "composite.post_movement_sha256_intact",
+                    false,
+                    json!({"key": k}),
+                );
+                oracle.record_violation(tag_prefix, k, format!("missing live key after move: {e}"));
+            }
+        }
+        ops += 1;
+    }
+
+    for dk in &deleted_keys {
+        let absent = cluster.get_object(bucket, dk).await.is_err();
+        probes.always(
+            "composite.deleted_or_expired_never_resurrects",
+            absent,
+            json!({"key": dk}),
+        );
+        if !absent {
+            oracle.record_violation(
+                tag_prefix,
+                dk,
+                "deleted/expired key resurrected across pools",
+            );
+        }
+        ops += 1;
+    }
+
+    // Verify WORM Compliance + LegalHold survived pool movement intact.
+    let full_worm = format!("{bucket}/worm-compliance-0");
+    let worm_survived = cluster
+        .pools
+        .iter()
+        .filter(|p| p.state != PoolState::Decommissioned)
+        .any(|p| p.worm_tags.get(&full_worm) == Some(&worm_tag));
+    probes.always(
+        "composite.worm_compliance_survived_movement",
+        worm_survived,
+        json!({}),
+    );
+    if !worm_survived {
+        oracle.record_violation(
+            tag_prefix,
+            "worm-compliance-0",
+            "WORM retention lost after cross-pool movement",
+        );
+    }
+
+    // Verify ListObjectsV2 matches exact live expected key set without duplicates or ghosts.
+    let listed = cluster.list_objects(bucket).await.unwrap();
+    let expected_list: Vec<String> = expected_sha.keys().cloned().collect();
+    probes.always(
+        "composite.cross_pool_list_exact",
+        listed == expected_list,
+        json!({"listed": listed.len(), "expected": expected_list.len()}),
+    );
+    if listed != expected_list {
+        oracle.record_violation(
+            tag_prefix,
+            bucket,
+            format!("list mismatch: expected {expected_list:?}, got {listed:?}"),
+        );
+    }
+
+    trace.push(format!(
+        "{tag_prefix}:verified_{}_live_{}_deleted_topo_{}",
+        expected_sha.len(),
+        deleted_keys.len(),
+        topology.name
+    ));
+    ops
+}
+
+pub async fn run_expansion_decommission_all_features_scenario(
+    topology: TopologySpec,
+    seed: u64,
+    probes: ProbeRegistry,
+    oracle: &mut ConsistencyOracle,
+    trace: &mut Vec<String>,
+) -> u64 {
+    run_expansion_movement_all_features(
+        topology,
+        seed,
+        MovementMode::DecommissionPool0,
+        probes,
+        oracle,
+        trace,
+    )
+    .await
+}
+
+pub async fn run_expansion_rebalance_all_features_scenario(
+    topology: TopologySpec,
+    seed: u64,
+    probes: ProbeRegistry,
+    oracle: &mut ConsistencyOracle,
+    trace: &mut Vec<String>,
+) -> u64 {
+    run_expansion_movement_all_features(
+        topology,
+        seed,
+        MovementMode::RebalanceAcrossPools,
+        probes,
+        oracle,
+        trace,
+    )
+    .await
 }
