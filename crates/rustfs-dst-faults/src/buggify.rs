@@ -29,12 +29,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
+struct SiteState {
+    active: bool,
+    rng: SimRng,
+    fired: u64,
+}
+
+#[derive(Debug)]
 struct BuggifyInner {
     seed: u64,
     activation_prob: f64,
-    rng: SimRng,
-    activated: BTreeMap<String, bool>,
-    fired_counts: BTreeMap<String, u64>,
+    sites: BTreeMap<String, SiteState>,
 }
 
 /// Deterministic two-stage fault injector modeled on FoundationDB's `BUGGIFY`.
@@ -52,9 +57,7 @@ impl Buggify {
             inner: Arc::new(Mutex::new(BuggifyInner {
                 seed: 0,
                 activation_prob: 0.0,
-                rng: SimRng::from_seed(0),
-                activated: BTreeMap::new(),
-                fired_counts: BTreeMap::new(),
+                sites: BTreeMap::new(),
             })),
         }
     }
@@ -66,9 +69,7 @@ impl Buggify {
             inner: Arc::new(Mutex::new(BuggifyInner {
                 seed,
                 activation_prob: activation_prob.clamp(0.0, 1.0),
-                rng: SimRng::from_seed(seed).fork("buggify"),
-                activated: BTreeMap::new(),
-                fired_counts: BTreeMap::new(),
+                sites: BTreeMap::new(),
             })),
         }
     }
@@ -89,19 +90,27 @@ impl Buggify {
             return false;
         }
         let mut inner = self.inner.lock().expect("Buggify lock poisoned");
-        let is_active = if let Some(&cached) = inner.activated.get(site) {
-            cached
-        } else {
+        if !inner.sites.contains_key(site) {
             let active = deterministic_activation(inner.seed, site, inner.activation_prob);
-            inner.activated.insert(site.to_string(), active);
-            active
-        };
-        if !is_active {
+            // Per-site sub-stream: firing one site must not shift another site's
+            // sequence when a new buggify point is added.
+            let rng = SimRng::from_seed(inner.seed).fork(&format!("buggify:{site}"));
+            inner.sites.insert(
+                site.to_string(),
+                SiteState {
+                    active,
+                    rng,
+                    fired: 0,
+                },
+            );
+        }
+        let state = inner.sites.get_mut(site).expect("buggify site");
+        if !state.active {
             return false;
         }
-        let fired = inner.rng.gen_bool(fire_prob);
+        let fired = state.rng.gen_bool(fire_prob);
         if fired {
-            *inner.fired_counts.entry(site.to_string()).or_insert(0) += 1;
+            state.fired += 1;
         }
         fired
     }
@@ -111,8 +120,11 @@ impl Buggify {
         self.inner
             .lock()
             .expect("Buggify lock poisoned")
-            .fired_counts
-            .clone()
+            .sites
+            .iter()
+            .filter(|(_, state)| state.fired > 0)
+            .map(|(site, state)| (site.clone(), state.fired))
+            .collect()
     }
 }
 
@@ -149,6 +161,22 @@ mod tests {
             .map(|i| b2.should_fire_with_prob(&format!("site_{}", i % 5), 0.3))
             .collect();
         assert_eq!(seq1, seq2);
+    }
+
+    #[test]
+    fn buggify_sites_do_not_perturb_each_other() {
+        let exercised = Buggify::seeded(99, 1.0);
+        let control = Buggify::seeded(99, 1.0);
+        for _ in 0..20 {
+            let _ = exercised.should_fire_with_prob("ecstore.skip_tmp_cleanup", 0.5);
+        }
+        let from_exercised: Vec<bool> = (0..30)
+            .map(|_| exercised.should_fire_with_prob("ecstore.other_site", 0.4))
+            .collect();
+        let from_control: Vec<bool> = (0..30)
+            .map(|_| control.should_fire_with_prob("ecstore.other_site", 0.4))
+            .collect();
+        assert_eq!(from_exercised, from_control);
     }
 
     #[test]

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Real Tokio [`turmoil`] virtual-TCP multi-node RustFS quorum simulation.
+//! Real Tokio [`turmoil`] virtual-TCP multi-node quorum simulation.
 //!
-//! Spawns 4 virtual RustFS storage nodes (`n1`..`n4`) inside `turmoil::Sim`
-//! communicating over real virtual TCP sockets (`turmoil::net::{TcpListener,
-//! TcpStream}`) and drives quorum writes/reads through deterministic
-//! `turmoil::partition`, `turmoil::hold`, `turmoil::repair`, and
-//! `turmoil::bounce` fault sequences.
+//! This tier checks the virtual TCP transport (framing, `partition`, `hold`,
+//! `repair`, `bounce`) with a node-majority quorum. It is not the erasure-set
+//! `SimECStore`: drive-level Reed-Solomon quorum stays in the in-process
+//! simulator. Node count follows the topology (`3` for `3x2`, `4` for `4x4`
+//! and `4x2`) and the write quorum is `nodes / 2 + 1`.
 
 use rustfs_dst_runtime::network::RpcFrame;
 use rustfs_dst_runtime::turmoil_net::{
@@ -27,17 +27,32 @@ use rustfs_dst_runtime::turmoil_net::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const RPC_PORT: u16 = 9000;
-type DurableKvDisk = Arc<Mutex<BTreeMap<String, (u64, String)>>>;
+
+#[derive(Clone, Debug)]
+struct Record {
+    generation: u64,
+    value: String,
+    prev: Option<(u64, String)>,
+}
+
+type DurableKvDisk = Arc<Mutex<BTreeMap<String, Record>>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ShardPutReq {
     key: String,
     generation: u64,
     value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShardRollbackReq {
+    key: String,
+    generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,18 +75,14 @@ pub struct TurmoilClusterReport {
     pub trace_sha256: String,
 }
 
-/// Run a deterministic 4-node virtual-TCP quorum cluster inside Tokio `turmoil`.
+/// Run a deterministic virtual-TCP quorum cluster inside Tokio `turmoil`.
 ///
-/// Exercises:
-/// 1. Healthy quorum PUT/GET across all 4 TCP nodes (W=3, R=3 of 4 nodes).
-/// 2. Minority isolation (`turmoil::partition("client", "n4")` + `turmoil::partition("n1", "n4")`):
-///    writes still succeed on 3 healthy nodes (`n1..n3`).
-/// 3. Majority split (2 nodes partitioned from client): writes MUST fail closed
-///    below quorum (W=3) and MUST NOT lose prior acknowledged writes.
-/// 4. Host bounce (`turmoil::bounce("n3")`) and link hold/repair (`turmoil::hold` /
-///    `turmoil::repair`): surviving durable state converges and reads remain
-///    strictly linearizable with deterministic trace digest.
-pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, String> {
+/// `nodes` is the storage-node count (not the drive count). Quorum is a strict
+/// majority of those nodes.
+pub fn run_turmoil_tcp_quorum_sim(nodes: usize, seed: u64) -> Result<TurmoilClusterReport, String> {
+    if !(2..=8).contains(&nodes) {
+        return Err(format!("turmoil node count {nodes} is outside 2..=8"));
+    }
     let cfg = TurmoilConfig {
         seed,
         simulation_duration: Duration::from_secs(30),
@@ -82,15 +93,16 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
     };
     let mut sim = build_turmoil_sim(&cfg);
 
-    let node_names = ["n1", "n2", "n3", "n4"];
+    let node_names: Vec<String> = (1..=nodes).map(|idx| format!("n{idx}")).collect();
     // Durable per-node storage surviving `turmoil::bounce` restarts.
     let durable_disks: Vec<DurableKvDisk> = (0..node_names.len())
         .map(|_| Arc::new(Mutex::new(BTreeMap::new())))
         .collect();
 
-    for (idx, &name) in node_names.iter().enumerate() {
+    for (idx, name) in node_names.iter().enumerate() {
         let disk = Arc::clone(&durable_disks[idx]);
-        sim.host(name, move || {
+        let host_name = name.clone();
+        sim.host(host_name, move || {
             let disk = Arc::clone(&disk);
             async move {
                 let listener = turmoil::net::TcpListener::bind(("0.0.0.0", RPC_PORT)).await?;
@@ -105,9 +117,47 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
                                         serde_json::from_slice(&req.payload).unwrap();
                                     let mut guard = disk.lock().unwrap();
                                     let existing_gen =
-                                        guard.get(&p.key).map(|(g, _)| *g).unwrap_or(0);
+                                        guard.get(&p.key).map(|rec| rec.generation).unwrap_or(0);
                                     if p.generation > existing_gen {
-                                        guard.insert(p.key, (p.generation, p.value));
+                                        let prev = guard
+                                            .get(&p.key)
+                                            .map(|rec| (rec.generation, rec.value.clone()));
+                                        guard.insert(
+                                            p.key,
+                                            Record {
+                                                generation: p.generation,
+                                                value: p.value,
+                                                prev,
+                                            },
+                                        );
+                                    }
+                                    RpcFrame::new("ok", b"ok".as_slice())
+                                }
+                                "rollback" => {
+                                    let p: ShardRollbackReq =
+                                        serde_json::from_slice(&req.payload).unwrap();
+                                    let mut guard = disk.lock().unwrap();
+                                    if guard
+                                        .get(&p.key)
+                                        .is_some_and(|rec| rec.generation == p.generation)
+                                    {
+                                        let prev =
+                                            guard.get(&p.key).and_then(|rec| rec.prev.clone());
+                                        match prev {
+                                            Some((generation, value)) => {
+                                                guard.insert(
+                                                    p.key,
+                                                    Record {
+                                                        generation,
+                                                        value,
+                                                        prev: None,
+                                                    },
+                                                );
+                                            }
+                                            None => {
+                                                guard.remove(&p.key);
+                                            }
+                                        }
                                     }
                                     RpcFrame::new("ok", b"ok".as_slice())
                                 }
@@ -115,10 +165,10 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
                                     let g: ShardGetReq =
                                         serde_json::from_slice(&req.payload).unwrap();
                                     let guard = disk.lock().unwrap();
-                                    if let Some((generation, value)) = guard.get(&g.key) {
+                                    if let Some(rec) = guard.get(&g.key) {
                                         let body = serde_json::to_vec(&ShardGetResp {
-                                            generation: *generation,
-                                            value: value.clone(),
+                                            generation: rec.generation,
+                                            value: rec.value.clone(),
                                         })
                                         .unwrap();
                                         RpcFrame::new("found", body)
@@ -138,12 +188,21 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
 
     let report_slot = Arc::new(Mutex::new(None::<TurmoilClusterReport>));
     let report_out = Arc::clone(&report_slot);
+    let names_for_client = node_names.clone();
+    let bounce_phase = Arc::new(AtomicU8::new(0));
+    let bounce_phase_client = Arc::clone(&bounce_phase);
+    let bounce_name = node_names[0].clone();
 
     sim.client("client", async move {
-        let peers = ["n1:9000", "n2:9000", "n3:9000", "n4:9000"];
-        let quorum = 3usize;
+        let peers: Vec<String> = names_for_client
+            .iter()
+            .map(|name| format!("{name}:{RPC_PORT}"))
+            .collect();
+        let peer_refs: Vec<&str> = peers.iter().map(String::as_str).collect();
+        let quorum = names_for_client.len() / 2 + 1;
         let timeout = Duration::from_millis(250);
         let mut trace = Vec::<String>::new();
+        trace.push(format!("nodes:{}:quorum:{quorum}", names_for_client.len()));
         let mut committed = 0u64;
         let mut rejected = 0u64;
         let mut reads = 0u64;
@@ -162,16 +221,28 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
                 value: value.to_string(),
             })
             .unwrap();
-            let mut ok = 0usize;
+            let rollback_body = serde_json::to_vec(&ShardRollbackReq {
+                key: key.to_string(),
+                generation,
+            })
+            .unwrap();
+            let mut applied = Vec::new();
             for addr in peers {
                 let frame = RpcFrame::new("put", body.clone());
                 if let Ok(resp) = turmoil_rpc_call(addr, frame, timeout).await
                     && resp.method == "ok"
                 {
-                    ok += 1;
+                    applied.push(*addr);
                 }
             }
-            ok >= quorum
+            if applied.len() >= quorum {
+                return true;
+            }
+            for addr in applied {
+                let frame = RpcFrame::new("rollback", rollback_body.clone());
+                let _ = turmoil_rpc_call(addr, frame, timeout).await;
+            }
+            false
         }
 
         async fn quorum_get(
@@ -202,47 +273,98 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
         }
 
         // Phase 1: Healthy cluster write & read.
-        assert!(quorum_put(&peers, quorum, timeout, "obj-a", 1, "val-v1").await);
+        assert!(
+            quorum_put(&peer_refs, quorum, timeout, "obj-a", 1, "val-v1").await,
+            "healthy quorum put"
+        );
         committed += 1;
         trace.push("put:obj-a:1:ok".to_string());
-        let r1 = quorum_get(&peers, quorum, timeout, "obj-a")
+        let r1 = quorum_get(&peer_refs, quorum, timeout, "obj-a")
             .await
             .expect("quorum read v1");
         assert_eq!(r1, (1, "val-v1".to_string()));
         reads += 1;
         trace.push("get:obj-a:1".to_string());
 
-        // Phase 2: Isolate single node `n4` -> 3 healthy nodes still form quorum.
-        turmoil::partition("client", "n4");
-        assert!(quorum_put(&peers, quorum, timeout, "obj-a", 2, "val-v2").await);
+        // Phase 2: Isolate the last node. The remainder is still a majority.
+        let isolated = names_for_client.last().expect("node").clone();
+        turmoil::partition("client", isolated.clone());
+        assert!(
+            quorum_put(&peer_refs, quorum, timeout, "obj-a", 2, "val-v2").await,
+            "majority remains after isolating one node"
+        );
         committed += 1;
-        trace.push("put:obj-a:2:degraded_ok".to_string());
-        let r2 = quorum_get(&peers, quorum, timeout, "obj-a")
+        trace.push(format!("put:obj-a:2:degraded_ok:isolated:{isolated}"));
+        let r2 = quorum_get(&peer_refs, quorum, timeout, "obj-a")
             .await
             .expect("degraded quorum read v2");
         assert_eq!(r2, (2, "val-v2".to_string()));
         reads += 1;
         trace.push("get:obj-a:2".to_string());
 
-        // Phase 3: Partition a second node (`n3`) -> only 2 reachable (< quorum 3), must reject write!
-        turmoil::partition("client", "n3");
-        let w3 = quorum_put(&peers, quorum, timeout, "obj-a", 3, "val-v3-split").await;
-        assert!(!w3, "write must fail closed when only 2/4 nodes reachable");
+        // Phase 3: Isolate one more node so the client is below majority.
+        // The partial put must roll back; a later read must still observe v2.
+        let second = names_for_client[names_for_client.len() - 2].clone();
+        turmoil::partition("client", second.clone());
+        let w3 = quorum_put(&peer_refs, quorum, timeout, "obj-a", 3, "val-v3-split").await;
+        assert!(
+            !w3,
+            "write must fail closed when fewer than {quorum} nodes are reachable"
+        );
         rejected += 1;
-        trace.push("put:obj-a:3:rejected_no_quorum".to_string());
+        trace.push(format!("put:obj-a:3:rejected_no_quorum:isolated:{second}"));
+        turmoil::repair("client", isolated);
+        turmoil::repair("client", second);
+        let after_reject = quorum_get(&peer_refs, quorum, timeout, "obj-a")
+            .await
+            .expect("read after rejected write");
+        assert_eq!(
+            after_reject,
+            (2, "val-v2".to_string()),
+            "rejected write became visible"
+        );
+        reads += 1;
+        trace.push("get:obj-a:2:after_rejected_put".to_string());
 
-        // Phase 4: Repair partitions, bounce `n3`, verify linearizable read still sees >= v2 (or v3 if applied on 2 nodes — wait, v3 never reached quorum!).
-        turmoil::repair("client", "n3");
-        turmoil::repair("client", "n4");
-        turmoil::hold("client", "n2");
-        turmoil::release("client", "n2");
+        // Phase 4: Hold every link across an RPC so the timeout is real, then release.
+        for name in &names_for_client {
+            turmoil::hold("client", name.clone());
+        }
+        let held = quorum_get(&peer_refs, quorum, timeout, "obj-a").await;
+        assert!(
+            held.is_none(),
+            "quorum read succeeded while every client link was held"
+        );
+        trace.push("get:obj-a:held_timeout".to_string());
+        for name in &names_for_client {
+            turmoil::release("client", name.clone());
+        }
+        let after_release = quorum_get(&peer_refs, quorum, timeout, "obj-a")
+            .await
+            .expect("read after releasing holds");
+        assert_eq!(after_release, (2, "val-v2".to_string()));
+        reads += 1;
+        trace.push("get:obj-a:2:after_hold".to_string());
 
-        // Write v4 on healed cluster -> supersedes any partial v3 shards deterministically.
-        assert!(quorum_put(&peers, quorum, timeout, "obj-a", 4, "val-v4").await);
+        // Phase 5: Ask the driver to bounce a node, then wait for that restart.
+        // `Sim::bounce` is not callable from inside a host. Durable state lives
+        // outside the restarted task.
+        bounce_phase_client.store(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_bounce = quorum_get(&peer_refs, quorum, timeout, "obj-a")
+            .await
+            .expect("read after host bounce");
+        assert_eq!(after_bounce, (2, "val-v2".to_string()));
+        reads += 1;
+        trace.push(format!("get:obj-a:2:after_bounce:{}", names_for_client[0]));
+
+        assert!(
+            quorum_put(&peer_refs, quorum, timeout, "obj-a", 4, "val-v4").await,
+            "healed quorum put"
+        );
         committed += 1;
         trace.push("put:obj-a:4:healed_ok".to_string());
-
-        let r4 = quorum_get(&peers, quorum, timeout, "obj-a")
+        let r4 = quorum_get(&peer_refs, quorum, timeout, "obj-a")
             .await
             .expect("post-heal read v4");
         assert_eq!(r4, (4, "val-v4".to_string()));
@@ -256,9 +378,9 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
         }
         let digest = hasher.finalize();
         let mut hex = String::with_capacity(64);
-        for b in digest {
+        for byte in digest {
             use std::fmt::Write;
-            let _ = write!(&mut hex, "{b:02x}");
+            let _ = write!(&mut hex, "{byte:02x}");
         }
 
         *report_out.lock().unwrap() = Some(TurmoilClusterReport {
@@ -271,13 +393,22 @@ pub fn run_turmoil_tcp_quorum_sim(seed: u64) -> Result<TurmoilClusterReport, Str
         Ok(())
     });
 
-    sim.run().map_err(|e| format!("turmoil sim failed: {e}"))?;
+    loop {
+        if bounce_phase.load(Ordering::SeqCst) == 1 {
+            sim.bounce(bounce_name.clone());
+            bounce_phase.store(2, Ordering::SeqCst);
+        }
+        let finished = sim
+            .step()
+            .map_err(|err| format!("turmoil sim failed: {err}"))?;
+        if finished {
+            break;
+        }
+    }
 
-    // Also prove host bounce (`turmoil::bounce`) executes cleanly in a fresh check.
-    let report = report_slot
+    report_slot
         .lock()
         .unwrap()
         .take()
-        .ok_or_else(|| "turmoil client did not produce report".to_string())?;
-    Ok(report)
+        .ok_or_else(|| "turmoil client did not produce report".to_string())
 }

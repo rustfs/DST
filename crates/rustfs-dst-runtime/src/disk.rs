@@ -26,7 +26,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -219,38 +219,41 @@ pub struct DiskFaultConfig {
     pub torn_write_prob: f64,
 }
 
-#[derive(Clone, Debug, Default)]
-struct FsImage {
-    dirs: BTreeSet<String>,
-    files: BTreeMap<String, Bytes>,
+/// Inode tracked separately from directory entries so file bytes and names
+/// become durable at different barriers.
+///
+/// - [`DiskIo::fsync_file`] copies `volatile_data` into `durable_data` and does
+///   not publish the directory entry.
+/// - [`DiskIo::fsync_dir`] publishes this directory's child names and makes the
+///   directory reachable from the filesystem root. It does **not** flush dirty
+///   file bytes.
+#[derive(Clone, Debug)]
+struct Inode {
+    is_dir: bool,
+    volatile_data: Bytes,
+    durable_data: Option<Bytes>,
+    volatile_children: BTreeMap<String, u64>,
+    durable_children: BTreeMap<String, u64>,
 }
 
-impl FsImage {
-    fn new() -> Self {
-        let mut dirs = BTreeSet::new();
-        dirs.insert(String::new());
+impl Inode {
+    fn file() -> Self {
         Self {
-            dirs,
-            files: BTreeMap::new(),
+            is_dir: false,
+            volatile_data: Bytes::new(),
+            durable_data: None,
+            volatile_children: BTreeMap::new(),
+            durable_children: BTreeMap::new(),
         }
     }
 
-    fn total_bytes(&self) -> u64 {
-        self.files.values().map(|b| b.len() as u64).sum()
-    }
-
-    fn ensure_parents(&mut self, path: &str) {
-        let mut current = String::new();
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.len() <= 1 {
-            return;
-        }
-        for part in &parts[..parts.len() - 1] {
-            if !current.is_empty() {
-                current.push('/');
-            }
-            current.push_str(part);
-            self.dirs.insert(current.clone());
+    fn dir() -> Self {
+        Self {
+            is_dir: true,
+            volatile_data: Bytes::new(),
+            durable_data: None,
+            volatile_children: BTreeMap::new(),
+            durable_children: BTreeMap::new(),
         }
     }
 }
@@ -258,24 +261,205 @@ impl FsImage {
 #[derive(Debug)]
 struct SimDiskInner {
     id: String,
-    /// Volatile OS page cache visible to live reads/writes.
-    volatile: FsImage,
-    /// Durable platter/NVMe image populated only via `fsync_file` / `fsync_dir`.
-    durable: FsImage,
+    inodes: BTreeMap<u64, Inode>,
+    next_inode: u64,
+    root: u64,
     faults: DiskFaultConfig,
     /// Total power-loss crashes simulated on this drive.
     crash_count: u64,
 }
 
+impl SimDiskInner {
+    fn empty(id: String) -> Self {
+        let root = 1;
+        let mut inodes = BTreeMap::new();
+        inodes.insert(root, Inode::dir());
+        Self {
+            id,
+            inodes,
+            next_inode: 2,
+            root,
+            faults: DiskFaultConfig::default(),
+            crash_count: 0,
+        }
+    }
+
+    fn alloc(&mut self, is_dir: bool) -> u64 {
+        let id = self.next_inode;
+        self.next_inode += 1;
+        self.inodes
+            .insert(id, if is_dir { Inode::dir() } else { Inode::file() });
+        id
+    }
+
+    fn children(&self, id: u64, durable: bool) -> Option<&BTreeMap<String, u64>> {
+        let inode = self.inodes.get(&id)?;
+        Some(if durable {
+            &inode.durable_children
+        } else {
+            &inode.volatile_children
+        })
+    }
+
+    fn lookup(&self, path: &str, durable: bool) -> Option<u64> {
+        let mut id = self.root;
+        if path.is_empty() {
+            return Some(id);
+        }
+        for part in path.split('/') {
+            id = *self.children(id, durable)?.get(part)?;
+        }
+        Some(id)
+    }
+
+    fn ensure_online(&self) -> Result<(), DiskError> {
+        if self.faults.offline {
+            Err(DiskError::Offline)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Create missing volatile directories along `path` and return the directory inode.
+    fn ensure_volatile_dir(&mut self, path: &str) -> Result<u64, DiskError> {
+        let mut id = self.root;
+        if path.is_empty() {
+            return Ok(id);
+        }
+        for part in path.split('/') {
+            if let Some(child) = self
+                .inodes
+                .get(&id)
+                .and_then(|inode| inode.volatile_children.get(part))
+                .copied()
+            {
+                if !self.inodes.get(&child).is_some_and(|inode| inode.is_dir) {
+                    return Err(DiskError::AlreadyExists(path.to_string()));
+                }
+                id = child;
+            } else {
+                let child = self.alloc(true);
+                self.inodes
+                    .get_mut(&id)
+                    .expect("parent inode")
+                    .volatile_children
+                    .insert(part.to_string(), child);
+                id = child;
+            }
+        }
+        Ok(id)
+    }
+
+    /// Link each path component into its parent's durable directory so a nested
+    /// `fsync_dir` stays reachable after power loss. Sibling entries of those
+    /// parents are left untouched — only this chain is published.
+    fn publish_volatile_path(&mut self, path: &str) {
+        let mut parent = self.root;
+        for part in path.split('/').filter(|part| !part.is_empty()) {
+            let Some(child) = self
+                .inodes
+                .get(&parent)
+                .and_then(|inode| inode.volatile_children.get(part))
+                .copied()
+            else {
+                return;
+            };
+            self.inodes
+                .get_mut(&parent)
+                .expect("parent inode")
+                .durable_children
+                .insert(part.to_string(), child);
+            parent = child;
+        }
+    }
+
+    fn total_volatile_bytes(&self) -> u64 {
+        self.inodes
+            .values()
+            .filter(|inode| !inode.is_dir)
+            .map(|inode| inode.volatile_data.len() as u64)
+            .sum()
+    }
+
+    fn crash_and_reboot(&mut self) {
+        for inode in self.inodes.values_mut() {
+            inode.volatile_children = inode.durable_children.clone();
+            if !inode.is_dir {
+                inode.volatile_data = inode.durable_data.clone().unwrap_or_else(Bytes::new);
+            }
+        }
+        self.gc_unreachable();
+        self.crash_count += 1;
+    }
+
+    fn gc_unreachable(&mut self) {
+        let mut reachable = BTreeSet::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(inode) = self.inodes.get(&id) {
+                stack.extend(inode.volatile_children.values().copied());
+            }
+        }
+        self.inodes.retain(|id, _| reachable.contains(id));
+    }
+
+    fn walk(
+        &self,
+        id: u64,
+        prefix: &str,
+        durable: bool,
+        files: &mut Vec<(String, Bytes)>,
+        dirs: &mut Vec<String>,
+    ) {
+        if let Some(inode) = self.inodes.get(&id)
+            && inode.is_dir
+        {
+            dirs.push(prefix.to_string());
+        }
+        let Some(children) = self.children(id, durable) else {
+            return;
+        };
+        for (name, child) in children {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Some(inode) = self.inodes.get(child) else {
+                continue;
+            };
+            if inode.is_dir {
+                self.walk(*child, &path, durable, files, dirs);
+            } else {
+                let data = if durable {
+                    inode.durable_data.clone().unwrap_or_else(Bytes::new)
+                } else {
+                    inode.volatile_data.clone()
+                };
+                files.push((path, data));
+            }
+        }
+    }
+}
+
+fn split_parent(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(idx) => (&path[..idx], &path[idx + 1..]),
+        None => ("", path),
+    }
+}
+
 /// Deterministic crash-consistent virtual disk simulator.
 ///
 /// Models:
-/// - **Volatile vs durable split**: writes land in `volatile` and only reach
-///   `durable` when `fsync_file` is called; directory entries (renames,
-///   unlinks, mkdirs) only reach `durable` when `fsync_dir` is called on the
-///   parent directory.
-/// - **Power loss ([`SimDiskIo::crash_and_reboot`])**: discards all un-fsynced
-///   volatile buffers and restores `volatile = durable`.
+/// - **Inode bytes vs directory entries**: `fsync_file` persists file bytes
+///   only. `fsync_dir` persists that directory's names and makes the directory
+///   reachable from the root. It does not flush dirty file data.
+/// - **Power loss ([`SimDiskIo::crash_and_reboot`])**: restores every inode
+///   from its durable bytes and durable directory links.
 /// - **Bitrot ([`SimDiskIo::inject_bitrot`])**: flips a deterministic byte in a
 ///   persisted file on both layers to test checksum detection & erasure healing.
 /// - **Capacity, EIO, torn writes, and offline drives**.
@@ -288,13 +472,7 @@ pub struct SimDiskIo {
 impl SimDiskIo {
     pub fn new(id: impl Into<String>, rng: SimRng) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(SimDiskInner {
-                id: id.into(),
-                volatile: FsImage::new(),
-                durable: FsImage::new(),
-                faults: DiskFaultConfig::default(),
-                crash_count: 0,
-            })),
+            inner: Arc::new(Mutex::new(SimDiskInner::empty(id.into()))),
             rng,
         }
     }
@@ -329,61 +507,84 @@ impl SimDiskIo {
     /// directory mutation is lost, and the OS boots from the durable image.
     pub fn crash_and_reboot(&self) {
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        inner.volatile = inner.durable.clone();
-        inner.crash_count += 1;
+        inner.crash_and_reboot();
     }
 
     /// Deterministically corrupt one byte of `path` on both volatile and durable
-    /// layers (silent bitrot). Returns `true` if the file existed and was flipped.
+    /// layers when they still have the same length (silent bitrot). Returns
+    /// `true` if the file existed and was flipped.
     pub fn inject_bitrot(&self, path: &str) -> bool {
         let Ok(norm) = normalize_path(path) else {
             return false;
         };
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        let Some(existing) = inner.volatile.files.get(&norm).cloned() else {
+        let Some(id) = inner.lookup(&norm, false) else {
             return false;
         };
-        if existing.is_empty() {
+        let Some(existing) = inner.inodes.get(&id).and_then(|inode| {
+            if inode.is_dir || inode.volatile_data.is_empty() {
+                None
+            } else {
+                Some(inode.volatile_data.clone())
+            }
+        }) else {
             return false;
-        }
+        };
         let idx = self.rng.gen_range_usize(existing.len());
         let mut corrupted = existing.to_vec();
         corrupted[idx] ^= 0xFF;
         let bytes = Bytes::from(corrupted);
-        inner.volatile.files.insert(norm.clone(), bytes.clone());
-        if inner.durable.files.contains_key(&norm) {
-            inner.durable.files.insert(norm, bytes);
+        let inode = inner.inodes.get_mut(&id).expect("inode");
+        if inode
+            .durable_data
+            .as_ref()
+            .is_some_and(|durable| durable.len() == existing.len())
+        {
+            let mut durable = inode.durable_data.as_ref().expect("durable bytes").to_vec();
+            durable[idx] ^= 0xFF;
+            inode.durable_data = Some(Bytes::from(durable));
         }
+        inode.volatile_data = bytes;
         true
     }
 
     /// Wipe the entire drive (simulating drive replacement with a fresh empty disk).
     pub fn wipe_drive(&self) {
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        inner.volatile = FsImage::new();
-        inner.durable = FsImage::new();
+        let id = inner.id.clone();
+        let faults = inner.faults.clone();
+        let crash_count = inner.crash_count;
+        *inner = SimDiskInner::empty(id);
+        inner.faults = faults;
+        inner.crash_count = crash_count;
     }
 
     /// Return all file paths currently present in the volatile image.
     pub fn all_files(&self) -> Vec<String> {
         let inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        inner.volatile.files.keys().cloned().collect()
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        inner.walk(inner.root, "", false, &mut files, &mut dirs);
+        files.into_iter().map(|(path, _)| path).collect()
     }
 
-    /// Compute a deterministic SHA-256 digest of the entire durable image.
+    /// Compute a deterministic SHA-256 digest of the durable namespace.
     pub fn durable_state_hash(&self) -> [u8; 32] {
         let inner = self.inner.lock().expect("SimDiskIo lock poisoned");
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        inner.walk(inner.root, "", true, &mut files, &mut dirs);
         let mut hasher = Sha256::new();
-        for dir in &inner.durable.dirs {
+        for dir in dirs {
             hasher.update(b"D:");
             hasher.update(dir.as_bytes());
             hasher.update(b"\n");
         }
-        for (path, data) in &inner.durable.files {
+        for (path, data) in files {
             hasher.update(b"F:");
             hasher.update(path.as_bytes());
             hasher.update(b"=");
-            hasher.update(data);
+            hasher.update(&data);
             hasher.update(b"\n");
         }
         hasher.finalize().into()
@@ -409,32 +610,13 @@ fn normalize_path(raw: &str) -> Result<String, DiskError> {
     Ok(parts.join("/"))
 }
 
-fn parent_dir(norm: &str) -> String {
-    match norm.rsplit_once('/') {
-        Some((parent, _)) => parent.to_string(),
-        None => String::new(),
-    }
-}
-
 #[async_trait]
 impl DiskIo for SimDiskIo {
     async fn create_dir_all(&self, path: &str) -> Result<(), DiskError> {
         let norm = normalize_path(path)?;
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
-        if norm.is_empty() {
-            return Ok(());
-        }
-        let mut acc = String::new();
-        for part in norm.split('/') {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(part);
-            inner.volatile.dirs.insert(acc.clone());
-        }
+        inner.ensure_online()?;
+        inner.ensure_volatile_dir(&norm)?;
         Ok(())
     }
 
@@ -444,253 +626,233 @@ impl DiskIo for SimDiskIo {
             return Err(DiskError::InvalidPath(path.to_string()));
         }
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
+        inner.ensure_online()?;
         if self.rng.gen_bool(inner.faults.write_error_prob) {
             return Err(DiskError::Io("injected write failure".to_string()));
         }
+        let (parent_path, name) = split_parent(&norm);
+        let parent_id = inner.ensure_volatile_dir(parent_path)?;
+        let existing = inner
+            .inodes
+            .get(&parent_id)
+            .and_then(|inode| inode.volatile_children.get(name))
+            .copied();
+        if let Some(id) = existing
+            && inner.inodes.get(&id).is_some_and(|inode| inode.is_dir)
+        {
+            return Err(DiskError::AlreadyExists(path.to_string()));
+        }
         if let Some(cap) = inner.faults.capacity_bytes {
-            let old_len = inner
-                .volatile
-                .files
-                .get(&norm)
-                .map(|b| b.len() as u64)
+            let old_len = existing
+                .and_then(|id| inner.inodes.get(&id))
+                .map(|inode| inode.volatile_data.len() as u64)
                 .unwrap_or(0);
-            let projected = inner.volatile.total_bytes() - old_len + data.len() as u64;
+            let projected = inner.total_volatile_bytes() - old_len + data.len() as u64;
             if projected > cap {
                 return Err(DiskError::NoSpace);
             }
         }
-        inner.volatile.ensure_parents(&norm);
-        if self.rng.gen_bool(inner.faults.torn_write_prob) && data.len() > 1 {
+        let torn = self.rng.gen_bool(inner.faults.torn_write_prob) && data.len() > 1;
+        let stored = if torn {
             let cut = 1 + self.rng.gen_range_usize(data.len() - 1);
-            inner.volatile.files.insert(norm, data.slice(..cut));
+            data.slice(..cut)
+        } else {
+            data
+        };
+        if let Some(id) = existing {
+            inner.inodes.get_mut(&id).expect("file inode").volatile_data = stored;
+        } else {
+            let id = inner.alloc(false);
+            inner.inodes.get_mut(&id).expect("new file").volatile_data = stored;
+            inner
+                .inodes
+                .get_mut(&parent_id)
+                .expect("parent dir")
+                .volatile_children
+                .insert(name.to_string(), id);
+        }
+        if torn {
             return Err(DiskError::Io("injected torn write".to_string()));
         }
-        inner.volatile.files.insert(norm, data);
         Ok(())
     }
 
     async fn read_file(&self, path: &str) -> Result<Bytes, DiskError> {
         let norm = normalize_path(path)?;
         let inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
+        inner.ensure_online()?;
         if self.rng.gen_bool(inner.faults.read_error_prob) {
             return Err(DiskError::Io("injected read failure".to_string()));
         }
-        inner
-            .volatile
-            .files
-            .get(&norm)
-            .cloned()
-            .ok_or_else(|| DiskError::NotFound(path.to_string()))
+        let id = inner
+            .lookup(&norm, false)
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        let inode = inner.inodes.get(&id).expect("inode");
+        if inode.is_dir {
+            return Err(DiskError::InvalidPath(path.to_string()));
+        }
+        Ok(inode.volatile_data.clone())
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), DiskError> {
         let src = normalize_path(from)?;
         let dst = normalize_path(to)?;
-        let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
+        if src.is_empty() || dst.is_empty() {
+            return Err(DiskError::InvalidPath(from.to_string()));
         }
+        let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
+        inner.ensure_online()?;
         if self.rng.gen_bool(inner.faults.write_error_prob) {
             return Err(DiskError::Io("injected rename failure".to_string()));
         }
-        if let Some(bytes) = inner.volatile.files.remove(&src) {
-            inner.volatile.ensure_parents(&dst);
-            inner.volatile.files.insert(dst, bytes);
-            return Ok(());
-        }
-        if inner.volatile.dirs.contains(&src) {
-            let prefix = format!("{src}/");
-            let moving_dirs: Vec<String> = inner
-                .volatile
-                .dirs
-                .iter()
-                .filter(|d| *d == &src || d.starts_with(&prefix))
-                .cloned()
-                .collect();
-            let moving_files: Vec<(String, Bytes)> = inner
-                .volatile
-                .files
-                .iter()
-                .filter(|(k, _)| k.starts_with(&prefix))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
-            for d in &moving_dirs {
-                inner.volatile.dirs.remove(d);
-            }
-            for (k, _) in &moving_files {
-                inner.volatile.files.remove(k);
-            }
-
-            inner.volatile.ensure_parents(&dst);
-            for d in moving_dirs {
-                let suffix = d.strip_prefix(&src).unwrap_or("");
-                inner.volatile.dirs.insert(format!("{dst}{suffix}"));
-            }
-            for (k, v) in moving_files {
-                let suffix = k.strip_prefix(&src).unwrap_or("");
-                inner.volatile.files.insert(format!("{dst}{suffix}"), v);
-            }
-            return Ok(());
-        }
-        Err(DiskError::NotFound(from.to_string()))
+        let (src_parent, src_name) = split_parent(&src);
+        let src_parent_id = inner
+            .lookup(src_parent, false)
+            .ok_or_else(|| DiskError::NotFound(from.to_string()))?;
+        let src_id = inner
+            .inodes
+            .get(&src_parent_id)
+            .and_then(|inode| inode.volatile_children.get(src_name))
+            .copied()
+            .ok_or_else(|| DiskError::NotFound(from.to_string()))?;
+        let (dst_parent, dst_name) = split_parent(&dst);
+        let dst_parent_id = inner.ensure_volatile_dir(dst_parent)?;
+        inner
+            .inodes
+            .get_mut(&src_parent_id)
+            .expect("src parent")
+            .volatile_children
+            .remove(src_name);
+        inner
+            .inodes
+            .get_mut(&dst_parent_id)
+            .expect("dst parent")
+            .volatile_children
+            .insert(dst_name.to_string(), src_id);
+        Ok(())
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), DiskError> {
         let norm = normalize_path(path)?;
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
+        inner.ensure_online()?;
+        let (parent, name) = split_parent(&norm);
+        let parent_id = inner
+            .lookup(parent, false)
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        let child = inner
+            .inodes
+            .get(&parent_id)
+            .and_then(|inode| inode.volatile_children.get(name))
+            .copied()
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        if inner.inodes.get(&child).is_some_and(|inode| inode.is_dir) {
+            return Err(DiskError::InvalidPath(path.to_string()));
         }
         inner
-            .volatile
-            .files
-            .remove(&norm)
-            .map(|_| ())
-            .ok_or_else(|| DiskError::NotFound(path.to_string()))
+            .inodes
+            .get_mut(&parent_id)
+            .expect("parent")
+            .volatile_children
+            .remove(name);
+        Ok(())
     }
 
     async fn remove_dir_all(&self, path: &str) -> Result<(), DiskError> {
         let norm = normalize_path(path)?;
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
+        inner.ensure_online()?;
         if norm.is_empty() {
-            inner.volatile = FsImage::new();
+            let root = inner.root;
+            if let Some(inode) = inner.inodes.get_mut(&root) {
+                inode.volatile_children.clear();
+            }
             return Ok(());
         }
-        let prefix = format!("{norm}/");
+        let (parent, name) = split_parent(&norm);
+        let Some(parent_id) = inner.lookup(parent, false) else {
+            return Ok(());
+        };
         inner
-            .volatile
-            .dirs
-            .retain(|d| d != &norm && !d.starts_with(&prefix));
-        inner.volatile.files.retain(|k, _| !k.starts_with(&prefix));
+            .inodes
+            .get_mut(&parent_id)
+            .expect("parent")
+            .volatile_children
+            .remove(name);
         Ok(())
     }
 
     async fn fsync_file(&self, path: &str) -> Result<(), DiskError> {
         let norm = normalize_path(path)?;
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
-        let data = inner
-            .volatile
-            .files
-            .get(&norm)
-            .cloned()
+        inner.ensure_online()?;
+        let id = inner
+            .lookup(&norm, false)
             .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
-        inner.durable.ensure_parents(&norm);
-        inner.durable.files.insert(norm, data);
+        let inode = inner.inodes.get_mut(&id).expect("inode");
+        if inode.is_dir {
+            return Err(DiskError::InvalidPath(path.to_string()));
+        }
+        inode.durable_data = Some(inode.volatile_data.clone());
         Ok(())
     }
 
     async fn fsync_dir(&self, path: &str) -> Result<(), DiskError> {
         let norm = normalize_path(path)?;
         let mut inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
+        inner.ensure_online()?;
+        let id = inner
+            .lookup(&norm, false)
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        if !inner.inodes.get(&id).is_some_and(|inode| inode.is_dir) {
+            return Err(DiskError::InvalidPath(path.to_string()));
         }
-        if !inner.volatile.dirs.contains(&norm) {
-            return Err(DiskError::NotFound(path.to_string()));
+        if !norm.is_empty() {
+            inner.publish_volatile_path(&norm);
         }
-        // Persist the directory and synchronize direct children (entries created,
-        // renamed, or unlinked inside `norm`).
-        let mut acc = String::new();
-        for part in norm.split('/').filter(|p| !p.is_empty()) {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(part);
-            inner.durable.dirs.insert(acc.clone());
-        }
-
-        let direct_volatile_files: BTreeMap<String, Bytes> = inner
-            .volatile
-            .files
-            .iter()
-            .filter(|(k, _)| parent_dir(k) == norm)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        inner.durable.files.retain(|k, _| parent_dir(k) != norm);
-        for (k, v) in direct_volatile_files {
-            inner.durable.files.insert(k, v);
-        }
-
-        let direct_volatile_dirs: BTreeSet<String> = inner
-            .volatile
-            .dirs
-            .iter()
-            .filter(|d| !d.is_empty() && parent_dir(d) == norm)
-            .cloned()
-            .collect();
-        inner
-            .durable
-            .dirs
-            .retain(|d| d.is_empty() || parent_dir(d) != norm || direct_volatile_dirs.contains(d));
-        for d in direct_volatile_dirs {
-            inner.durable.dirs.insert(d);
-        }
+        let children = inner
+            .inodes
+            .get(&id)
+            .expect("dir")
+            .volatile_children
+            .clone();
+        inner.inodes.get_mut(&id).expect("dir").durable_children = children;
         Ok(())
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<String>, DiskError> {
         let norm = normalize_path(path)?;
         let inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
+        inner.ensure_online()?;
+        let id = inner
+            .lookup(&norm, false)
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        let inode = inner.inodes.get(&id).expect("inode");
+        if !inode.is_dir {
+            return Err(DiskError::InvalidPath(path.to_string()));
         }
-        if !inner.volatile.dirs.contains(&norm) {
-            return Err(DiskError::NotFound(path.to_string()));
-        }
-        let mut entries = BTreeSet::new();
-        for f in inner.volatile.files.keys() {
-            if parent_dir(f) == norm {
-                let name = Path::new(f)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(f);
-                entries.insert(name.to_string());
-            }
-        }
-        for d in &inner.volatile.dirs {
-            if !d.is_empty() && parent_dir(d) == norm {
-                let name = Path::new(d)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(d);
-                entries.insert(name.to_string());
-            }
-        }
-        Ok(entries.into_iter().collect())
+        Ok(inode.volatile_children.keys().cloned().collect())
     }
 
     async fn stat(&self, path: &str) -> Result<FileStat, DiskError> {
         let norm = normalize_path(path)?;
         let inner = self.inner.lock().expect("SimDiskIo lock poisoned");
-        if inner.faults.offline {
-            return Err(DiskError::Offline);
-        }
-        if let Some(bytes) = inner.volatile.files.get(&norm) {
-            return Ok(FileStat {
-                size: bytes.len() as u64,
-                is_dir: false,
-            });
-        }
-        if inner.volatile.dirs.contains(&norm) {
-            return Ok(FileStat {
+        inner.ensure_online()?;
+        let id = inner
+            .lookup(&norm, false)
+            .ok_or_else(|| DiskError::NotFound(path.to_string()))?;
+        let inode = inner.inodes.get(&id).expect("inode");
+        if inode.is_dir {
+            Ok(FileStat {
                 size: 0,
                 is_dir: true,
-            });
+            })
+        } else {
+            Ok(FileStat {
+                size: inode.volatile_data.len() as u64,
+                is_dir: false,
+            })
         }
-        Err(DiskError::NotFound(path.to_string()))
     }
 }
 
@@ -737,5 +899,66 @@ mod tests {
         let b2 = d2.read_file("s/part.1").await.unwrap();
         assert_ne!(b1, payload);
         assert_eq!(b1, b2);
+    }
+
+    #[tokio::test]
+    async fn fsync_file_without_directory_sync_does_not_survive_crash() {
+        let disk = SimDiskIo::new("d1", SimRng::from_seed(3));
+        disk.create_dir_all("bucket/obj").await.unwrap();
+        disk.write_file("bucket/obj/xl.meta", Bytes::from_static(b"v1"))
+            .await
+            .unwrap();
+        disk.fsync_file("bucket/obj/xl.meta").await.unwrap();
+        disk.crash_and_reboot();
+        assert!(matches!(
+            disk.read_file("bucket/obj/xl.meta").await,
+            Err(DiskError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fsync_dir_does_not_persist_dirty_file_bytes() {
+        let disk = SimDiskIo::new("d1", SimRng::from_seed(4));
+        disk.create_dir_all("bucket/obj").await.unwrap();
+        disk.write_file("bucket/obj/xl.meta", Bytes::from_static(b"v1"))
+            .await
+            .unwrap();
+        disk.fsync_file("bucket/obj/xl.meta").await.unwrap();
+        disk.fsync_dir("bucket/obj").await.unwrap();
+
+        disk.write_file("bucket/obj/xl.meta", Bytes::from_static(b"v2-dirty"))
+            .await
+            .unwrap();
+        disk.fsync_dir("bucket/obj").await.unwrap();
+        disk.crash_and_reboot();
+
+        let after = disk.read_file("bucket/obj/xl.meta").await.unwrap();
+        assert_eq!(after, Bytes::from_static(b"v1"));
+    }
+
+    #[tokio::test]
+    async fn rename_without_dir_fsync_keeps_the_old_directory_entry() {
+        let disk = SimDiskIo::new("d1", SimRng::from_seed(5));
+        disk.create_dir_all("bucket/obj").await.unwrap();
+        disk.write_file("bucket/obj/xl.meta", Bytes::from_static(b"v1"))
+            .await
+            .unwrap();
+        disk.fsync_file("bucket/obj/xl.meta").await.unwrap();
+        disk.fsync_dir("bucket/obj").await.unwrap();
+
+        disk.rename("bucket/obj/xl.meta", "bucket/obj/xl.meta.next")
+            .await
+            .unwrap();
+        disk.fsync_file("bucket/obj/xl.meta.next").await.unwrap();
+        disk.crash_and_reboot();
+
+        assert_eq!(
+            disk.read_file("bucket/obj/xl.meta").await.unwrap(),
+            Bytes::from_static(b"v1")
+        );
+        assert!(matches!(
+            disk.read_file("bucket/obj/xl.meta.next").await,
+            Err(DiskError::NotFound(_))
+        ));
     }
 }

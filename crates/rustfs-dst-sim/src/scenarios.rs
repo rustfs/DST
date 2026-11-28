@@ -316,7 +316,7 @@ impl FromStr for ScenarioKind {
 }
 
 /// Complete report produced by one deterministic `(scenario, topology, seed)` run.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioReport {
     pub scenario: ScenarioKind,
     pub topology: String,
@@ -342,7 +342,7 @@ pub fn run_scenario(scenario: ScenarioKind, topology: TopologyKind, seed: u64) -
 }
 
 fn run_turmoil_scenario(topology: TopologySpec, seed: u64) -> ScenarioReport {
-    match run_turmoil_tcp_quorum_sim(seed) {
+    match run_turmoil_tcp_quorum_sim(topology.nodes, seed) {
         Ok(rep) => ScenarioReport {
             scenario: ScenarioKind::TurmoilTcpCluster,
             topology: topology.name.to_string(),
@@ -380,6 +380,7 @@ fn hash_trace(cluster: &SimCluster, extra_events: &[String]) -> String {
     for net_ev in cluster.network.trace_snapshot() {
         hasher.update(b"N:");
         hasher.update(net_ev.seq.to_le_bytes());
+        hasher.update(net_ev.at_ms.to_le_bytes());
         hasher.update(net_ev.from.as_bytes());
         hasher.update(b"->");
         hasher.update(net_ev.to.as_bytes());
@@ -596,16 +597,30 @@ async fn run_scenario_async(
     }
 
     let trace_sha256 = hash_trace(&cluster, &trace);
-    let passed = oracle.is_valid();
+    let probes = cluster.probes.snapshot();
+    let mut violations = oracle.violations().to_vec();
+    for probe in probes.values().filter(|probe| probe.is_violated()) {
+        let invariant = probe.id.strip_prefix("invariant.").unwrap_or(&probe.id);
+        if !violations
+            .iter()
+            .any(|violation| violation.invariant == invariant)
+        {
+            violations.push(InvariantViolation {
+                invariant: invariant.to_string(),
+                key: "scenario".to_string(),
+                detail: format!("assertion failed {} times", probe.fail_count),
+            });
+        }
+    }
     ScenarioReport {
         scenario,
         topology: topology.name.to_string(),
         seed,
-        passed,
+        passed: violations.is_empty(),
         operations: ops,
         trace_sha256,
-        violations: oracle.violations().to_vec(),
-        probes: cluster.probes.snapshot(),
+        violations,
+        probes,
     }
 }
 
@@ -696,7 +711,7 @@ async fn scenario_erasure_quorum(
         // Read from another surviving node must return exact new payload.
         let reader = &live_nodes[rng.gen_range_usize(live_nodes.len())];
         match cluster.get_object(reader, bucket, key).await {
-            Ok(got) => oracle.check_read_present(&full, got.generation, &got.payload),
+            Ok(got) => oracle.check_get_result(&full, &got),
             Err(e) => oracle.record_violation(
                 "degraded_read_availability",
                 &full,
@@ -759,34 +774,70 @@ async fn scenario_erasure_quorum(
     }
     ops += 1;
 
+    // S3 If-None-Match: * treats a delete marker as "object does not exist".
+    let replacement = b"recreated-after-delete";
+    let recreated = cluster
+        .put_object(
+            &nodes[0],
+            bucket,
+            del_key,
+            replacement,
+            PutConditions {
+                if_none_match_any: true,
+                if_match_sha256: None,
+            },
+        )
+        .await;
+    cluster.probes.always(
+        "invariant.if_none_match_allows_delete_marker",
+        recreated.is_ok(),
+        json!({"key": del_full, "outcome": format!("{recreated:?}")}),
+    );
+    match recreated {
+        Ok(put) => {
+            let digest = oracle.record_submitted_payload(&del_full, replacement);
+            oracle.record_acked_put(&del_full, put.generation, put.version_id, digest);
+            match cluster.get_object(&nodes[1], bucket, del_key).await {
+                Ok(got) => oracle.check_get_result(&del_full, &got),
+                Err(err) => {
+                    oracle.record_violation("recreate_visibility", &del_full, err.to_string())
+                }
+            }
+            ops += 1;
+        }
+        Err(err) => oracle.record_violation(
+            "if_none_match_after_delete",
+            &del_full,
+            format!("If-None-Match rejected a delete marker: {err}"),
+        ),
+    }
+    let deleted_again = cluster
+        .delete_object(&nodes[0], bucket, del_key)
+        .await
+        .expect("delete restored key");
+    oracle.record_acked_delete(
+        &del_full,
+        deleted_again.generation,
+        deleted_again.version_id,
+    );
+    ops += 2;
+
+    // LIST must reflect the acknowledged overwrite and delete before repair runs.
+    match cluster.list_objects(&nodes[0], bucket).await {
+        Ok(listed) => oracle.check_acked_listing(bucket, &listed),
+        Err(err) => oracle.record_violation("list_availability", bucket, err.to_string()),
+    }
+    ops += 1;
+
     for key in &keys {
         let _ = cluster.heal_object(&nodes[0], bucket, key).await;
     }
     cluster.sweep_tmp_orphans(&nodes[0]).await;
 
-    let listed = cluster
-        .list_objects(&nodes[0], bucket)
-        .await
-        .expect("list_objects");
-    let listed_keys: Vec<String> = listed.iter().map(|o| o.key.clone()).collect();
-    let expected_live: Vec<String> = keys[..keys.len() - 1].to_vec();
-    cluster.probes.always(
-        "invariant.list_objects_exact_match",
-        listed_keys == expected_live,
-        json!({"listed": listed_keys, "expected": expected_live}),
-    );
-    if listed_keys != expected_live {
-        oracle.record_violation(
-            "list_consistency",
-            bucket,
-            format!("expected {expected_live:?}, got {listed_keys:?}"),
-        );
-    }
-
     for err in cluster.verify_cluster_convergence(bucket, &keys).await {
         oracle.record_violation("heal_convergence", bucket, err);
     }
-    ops + 1
+    ops
 }
 
 async fn scenario_crash_consistency(
@@ -853,7 +904,7 @@ async fn scenario_crash_consistency(
             .get_object(&nodes[1 % nodes.len()], bucket, &key)
             .await
             .expect("object must remain readable as intact old or intact new after crash");
-        oracle.check_read_present(&full, got.generation, &got.payload);
+        oracle.check_get_result(&full, &got);
         cluster.probes.reachable(
             "ecstore.crash_window_survived_cleanly",
             json!({"crash_point": format!("{cp:?}"), "key": full, "read_gen": got.generation}),
@@ -907,7 +958,7 @@ async fn scenario_bitrot_heal(
         .get_object(&nodes[nodes.len() - 1], bucket, key)
         .await
         .expect("RS must transparently recover from parity_shards bitrotted drives");
-    oracle.check_read_present(&full, got.generation, &got.payload);
+    oracle.check_get_result(&full, &got);
 
     // Run online heal and confirm every bitrotted drive is repaired cleanly.
     let healed = cluster
@@ -983,7 +1034,7 @@ async fn scenario_multipart_commit(
         .get_object(&nodes[0], bucket, key)
         .await
         .expect("pre-complete read");
-    oracle.check_read_present(&full, pre.generation, &pre.payload);
+    oracle.check_get_result(&full, &pre);
 
     // Arm crash window during multipart commit, then complete!
     cluster
@@ -1003,7 +1054,7 @@ async fn scenario_multipart_commit(
         .get_object(&nodes[1 % nodes.len()], bucket, key)
         .await
         .expect("post-complete read");
-    oracle.check_read_present(&full, post.generation, &post.payload);
+    oracle.check_get_result(&full, &post);
 
     // Also test AbortMultipartUpload leaves live object untouched.
     let aborted_id = cluster.create_multipart(bucket, key);
@@ -1017,7 +1068,7 @@ async fn scenario_multipart_commit(
         .get_object(&nodes[0], bucket, key)
         .await
         .expect("read after abort");
-    oracle.check_read_present(&full, after_abort.generation, &after_abort.payload);
+    oracle.check_get_result(&full, &after_abort);
 
     let _ = cluster.heal_object(&nodes[0], bucket, key).await;
     cluster.sweep_tmp_orphans(&nodes[0]).await;
@@ -1101,7 +1152,33 @@ async fn scenario_distributed_lock_skew(
     }
     c2.release(&lease2).await;
     oracle.record_lock_released(resource, "owner-2");
-    ops + 2
+    ops += 2;
+
+    // Negative control: a wall-clock lease MUST expire when skew jumps past
+    // its TTL. Monotonic leases above must keep failing that test.
+    cluster.clock.clear_faults();
+    let wall = "dst-locks/wall-clock-lease";
+    let wall_lease = c1
+        .acquire(wall, "owner-wall", 5_000, true)
+        .await
+        .expect("wall-clock lease");
+    for node in &nodes {
+        cluster.clock.set_node_skew_ms(node, 60_000);
+    }
+    let stolen = c2.acquire(wall, "owner-wall-2", 5_000, true).await;
+    cluster.probes.always(
+        "invariant.wall_clock_lease_expires_under_skew",
+        stolen.is_ok(),
+        json!({"stolen": format!("{stolen:?}"), "fence": wall_lease.fence_token}),
+    );
+    if stolen.is_err() {
+        oracle.record_violation(
+            "wall_clock_lease_skew",
+            wall,
+            "wall-clock lease survived a 60s skew jump",
+        );
+    }
+    ops + 1
 }
 
 async fn scenario_swizzle_clog_chaos(
@@ -1143,7 +1220,8 @@ async fn scenario_swizzle_clog_chaos(
             let key = &keys[rng.gen_range_usize(keys.len())];
             let full = format!("{bucket}/{key}");
             let via = &nodes[rng.gen_range_usize(nodes.len())];
-            if rng.gen_bool(0.55) {
+            let roll = rng.next_u64() % 100;
+            if roll < 45 {
                 let payload = deterministic_payload(rng, 128, 1024);
                 let hash = oracle.record_submitted_payload(&full, &payload);
                 match cluster
@@ -1161,9 +1239,22 @@ async fn scenario_swizzle_clog_chaos(
                     }
                     Err(_) => {}
                 }
+            } else if roll < 65 {
+                match cluster.delete_object(via, bucket, key).await {
+                    Ok(res) => {
+                        oracle.record_acked_delete(&full, res.generation, res.version_id);
+                    }
+                    Err(StoreError::Indeterminate {
+                        generation,
+                        version_id,
+                    }) => {
+                        oracle.record_indeterminate_delete(&full, generation, version_id);
+                    }
+                    Err(_) => {}
+                }
             } else {
                 match cluster.get_object(via, bucket, key).await {
-                    Ok(got) => oracle.check_read_present(&full, got.generation, &got.payload),
+                    Ok(got) => oracle.check_get_result(&full, &got),
                     Err(StoreError::NotFound(_)) => oracle.check_read_not_found(&full),
                     Err(_) => {}
                 }
@@ -1183,7 +1274,7 @@ async fn scenario_swizzle_clog_chaos(
     for key in &keys {
         let full = format!("{bucket}/{key}");
         match cluster.get_object(&nodes[0], bucket, key).await {
-            Ok(got) => oracle.check_read_present(&full, got.generation, &got.payload),
+            Ok(got) => oracle.check_get_result(&full, &got),
             Err(StoreError::NotFound(_)) => oracle.check_read_not_found(&full),
             Err(e) => oracle.record_violation(
                 "post_chaos_availability",
